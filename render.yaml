@@ -1,0 +1,48 @@
+services:
+  - type: web
+    name: vaidic-sanskar-backend
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: CORS_ORIGIN
+        value: '*'
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: MONGODB_URI
+        sync: false
+      - key: CLOUDINARY_CLOUD_NAME
+        sync: false
+      - key: CLOUDINARY_API_KEY
+        sync: false
+      - key: CLOUDINARY_API_SECRET
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: EMAIL_FROM
+        sync: false
+      - key: AGORA_APP_ID
+        sync: false
+      - key: EXPO_PUBLIC_AGORA_APP_ID
+        sync: false
+      - key: EXPO_PUBLIC_MAPPLS_REST_KEY
+        sync: false
+      - key: EXPO_PUBLIC_MAPPLS_CLIENT_ID
+        sync: false
+      - key: EXPO_PUBLIC_MAPPLS_CLIENT_SECRET
+        sync: false
