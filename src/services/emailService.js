@@ -17,22 +17,18 @@ function getTransporter() {
 
   const isGmail = host.includes('gmail.com') || user.toLowerCase().endsWith('@gmail.com');
 
-  transporter = nodemailer.createTransport(
-    isGmail
-      ? {
-        service: 'gmail',
-        auth: { user, pass },
-      }
-      : {
-        host,
-        port,
-        secure: port === 465,
-        auth: { user, pass },
-        tls: {
-          rejectUnauthorized: false,
-        },
-      }
-  );
+  transporter = nodemailer.createTransport({
+    host: isGmail ? 'smtp.gmail.com' : host,
+    port: isGmail ? 465 : (port === 465 ? 465 : 587),
+    secure: isGmail || port === 465, // SSL on 465 bypasses cloud SMTP port 587 restrictions
+    auth: { user, pass },
+    connectionTimeout: 8000,
+    greetingTimeout: 8000,
+    socketTimeout: 12000,
+    tls: {
+      rejectUnauthorized: false,
+    },
+  });
 
   return transporter;
 }
@@ -143,12 +139,19 @@ async function sendPartnerOtpEmail({ to, name = 'User', otp, lang = 'en' }) {
 async function verifySmtp() {
   const mailer = getTransporter();
   if (!mailer) return false;
+
+  // Race verify against a 6-second timeout so server never hangs during deployment
+  const verifyPromise = mailer.verify();
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Connection timeout (Render dynamic IP / port filter)')), 6000)
+  );
+
   try {
-    await mailer.verify();
+    await Promise.race([verifyPromise, timeoutPromise]);
     console.log('  📧 SMTP Server Connected and Verified Successfully!');
     return true;
   } catch (err) {
-    console.warn('  ⚠️ SMTP verify warning:', err.message);
+    console.warn(`  ℹ️ SMTP verify notice: ${err.message}. OTP delivery will fallback to active console log & API response.`);
     return false;
   }
 }

@@ -130,8 +130,8 @@ server.listen(PORT, async () => {
   console.log(`  →  Admin   http://localhost:${PORT}/admin`);
   console.log(`  →  Socket  ws://localhost:${PORT}\n`);
 
-  // Verify SMTP Email connectivity
-  await verifySmtp();
+  // Verify SMTP Email connectivity in background
+  verifySmtp().catch(() => {});
 
   // Connect MongoDB if MONGODB_URI is provided
   const connected = await connectDB();
