@@ -11,6 +11,7 @@ const authRoutes = require('./routes/authRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const partnerRoutes = require('./routes/partnerRoutes');
 const userRoutes = require('./routes/userRoutes');
+const agoraRoutes = require('./routes/agoraRoutes');
 
 const multer = require('multer');
 const { uploadToCloudinary } = require('./services/cloudinaryService');
@@ -76,6 +77,7 @@ app.use('/api/partner', authRoutes); // direct partner auth endpoints like /regi
 
 app.use('/api/admin', adminRoutes);
 app.use('/api/partner', partnerRoutes);
+app.use('/api/agora', agoraRoutes);
 app.use('/api', userRoutes);
 
 /* ---------------- REACT ADMIN CONSOLE ----------------

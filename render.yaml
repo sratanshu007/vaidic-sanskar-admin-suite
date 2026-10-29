@@ -38,6 +38,8 @@ services:
         sync: false
       - key: AGORA_APP_ID
         sync: false
+      - key: AGORA_APP_CERTIFICATE
+        sync: false
       - key: EXPO_PUBLIC_AGORA_APP_ID
         sync: false
       - key: EXPO_PUBLIC_MAPPLS_REST_KEY
@@ -46,3 +48,4 @@ services:
         sync: false
       - key: EXPO_PUBLIC_MAPPLS_CLIENT_SECRET
         sync: false
+

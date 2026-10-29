@@ -128,3 +128,4 @@ Render Free tier 15 minutes inactive rehne par sleep ho jata hai. Isko 24/7 awak
 2. Monitor URL set karein: `https://<your-service-name>.onrender.com/api/health`
 3. Interval: Har **10 minutes**
 Isse aapka backend hamesha active rahega bina kisi sleep delay ke!
+

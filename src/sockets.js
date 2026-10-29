@@ -10,6 +10,7 @@
  */
 let ioRef = null;
 const activeAstroPartners = new Map();
+const { generateRtcToken } = require('./services/agoraService');
 
 function getLiveAstrologers() {
   return Array.from(activeAstroPartners.values());
@@ -130,22 +131,54 @@ function initSockets(io) {
     socket.on('astro:call:initiate', (payload) => {
       const { channelName, recipientId, caller, mode } = payload || {};
       console.log(`📞 [Astro Consultation] Initiating ${mode} from ${caller?.name} on channel ${channelName}`);
+      
+      let enrichedPayload = { ...payload };
+      try {
+        if (channelName) {
+          const agoraData = generateRtcToken({ channelName, role: 'publisher' });
+          enrichedPayload = {
+            ...payload,
+            agoraAppId: agoraData.appId,
+            agoraToken: agoraData.token,
+            agoraMode: agoraData.mode,
+          };
+        }
+      } catch (err) {
+        console.warn('⚠️ Agora token generation error in astro:call:initiate:', err.message);
+      }
+
       if (recipientId) {
-        io.to(`vendor:${recipientId}`).emit('astro:call:incoming', payload);
-        io.to(`pandit:${recipientId}`).emit('astro:call:incoming', payload);
-        io.to(`user:${recipientId}`).emit('astro:call:incoming', payload);
+        io.to(`vendor:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
+        io.to(`pandit:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
+        io.to(`user:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
       } else {
-        io.emit('astro:call:incoming', payload);
+        io.emit('astro:call:incoming', enrichedPayload);
       }
     });
 
     socket.on('astro:call:accept', (payload) => {
       const { channelName, callerId } = payload || {};
       console.log(`✅ [Astro Consultation] Accepted for channel ${channelName}`);
+
+      let enrichedPayload = { ...payload };
+      try {
+        if (channelName) {
+          const agoraData = generateRtcToken({ channelName, role: 'publisher' });
+          enrichedPayload = {
+            ...payload,
+            agoraAppId: agoraData.appId,
+            agoraToken: agoraData.token,
+            agoraMode: agoraData.mode,
+          };
+        }
+      } catch (err) {
+        console.warn('⚠️ Agora token generation error in astro:call:accept:', err.message);
+      }
+
       if (callerId) {
-        io.to(`user:${callerId}`).emit('astro:call:connected', payload);
+        io.to(`user:${callerId}`).emit('astro:call:connected', enrichedPayload);
       } else {
-        io.emit('astro:call:connected', payload);
+        io.emit('astro:call:connected', enrichedPayload);
       }
     });
 
