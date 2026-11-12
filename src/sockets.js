@@ -12,8 +12,81 @@ let ioRef = null;
 const activeAstroPartners = new Map();
 const { generateRtcToken } = require('./services/agoraService');
 
-function getLiveAstrologers() {
-  return Array.from(activeAstroPartners.values());
+function isSocketActive(io, socketId) {
+  if (!socketId || !io?.sockets?.sockets?.get) return true;
+  const s = io.sockets.sockets.get(socketId);
+  return Boolean(s && s.connected !== false);
+}
+
+function getLiveAstrologers(io = ioRef) {
+  const list = [];
+  for (const [partnerId, partner] of activeAstroPartners.entries()) {
+    if (!partner || partner.isOnline === false || !isSocketActive(io, partner.socketId)) {
+      activeAstroPartners.delete(partnerId);
+      continue;
+    }
+    list.push(partner);
+  }
+  return list;
+}
+
+function isRoomOccupied(io, roomName) {
+  const room = io?.sockets?.adapter?.rooms?.get?.(roomName);
+  return Boolean(room && room.size > 0);
+}
+
+function isSocketRoomActiveInRole(io, targetRoom, roleRoom) {
+  const rooms = io?.sockets?.adapter?.rooms;
+  if (!rooms?.get) return false;
+  const targets = rooms.get(targetRoom);
+  const roleMembers = rooms.get(roleRoom);
+  if (!targets || !roleMembers) return false;
+  for (const sid of targets) {
+    if (roleMembers.has(sid)) return true;
+  }
+  return false;
+}
+
+function emitOnceToRooms(io, roomNames, event, payload, excludeSocketId = null) {
+  const roomsMap = io?.sockets?.adapter?.rooms;
+  if (roomsMap?.get) {
+    const delivered = new Set();
+    roomNames.filter(Boolean).forEach((room) => {
+      const members = roomsMap.get(room);
+      if (members) {
+        for (const sid of members) {
+          if (sid !== excludeSocketId && !delivered.has(sid)) {
+            delivered.add(sid);
+            io.to(sid).emit(event, payload);
+          }
+        }
+      }
+    });
+    return delivered.size;
+  }
+  roomNames.filter(Boolean).forEach((room) => {
+    io.to(room).emit(event, payload);
+  });
+  return roomNames.length;
+}
+
+function markAstroOffline(io, socket, partnerId) {
+  const pid = partnerId ? String(partnerId) : socket.partnerAstroId;
+  try {
+    socket.leave?.('role:astro');
+  } catch (_) {}
+  if (pid && activeAstroPartners.has(pid)) {
+    const p = activeAstroPartners.get(pid);
+    activeAstroPartners.delete(pid);
+    console.log(`🔌 [Live Socket] Astro Partner Went Offline: ${p?.name || pid} (${pid})`);
+  }
+  if (socket.partnerAstroId === pid) {
+    socket.partnerAstroId = null;
+  }
+  if (pid) {
+    io.emit('astro:offline', { id: pid, vendorId: pid, isOnline: false });
+  }
+  io.emit('astro:list', getLiveAstrologers(io));
 }
 
 function initSockets(io) {
@@ -47,16 +120,12 @@ function initSockets(io) {
       role,
     });
     // Immediately send current live astrologers to the newly connected client
-    socket.emit('astro:list', Array.from(activeAstroPartners.values()));
+    socket.emit('astro:list', getLiveAstrologers(io));
 
     socket.on('disconnect', (reason) => {
       console.log(`🔌 [Socket.IO] Client disconnected: ${socket.id} (reason: ${reason})`);
       if (socket.partnerAstroId && activeAstroPartners.has(socket.partnerAstroId)) {
-        const p = activeAstroPartners.get(socket.partnerAstroId);
-        activeAstroPartners.delete(socket.partnerAstroId);
-        console.log(`🔌 [Live Socket] Partner Went Offline: ${p?.name} (${socket.partnerAstroId})`);
-        io.emit('astro:offline', { id: socket.partnerAstroId, isOnline: false });
-        io.emit('astro:list', Array.from(activeAstroPartners.values()));
+        markAstroOffline(io, socket, socket.partnerAstroId);
       }
     });
 
@@ -86,6 +155,12 @@ function initSockets(io) {
       if (vendorId) {
         socket.join(`vendor:${vendorId}`);
         socket.join(`pandit:${vendorId}`);
+      }
+    });
+
+    socket.on('user:join', ({ userId }) => {
+      if (userId) {
+        socket.join(`user:${userId}`);
       }
     });
 
@@ -130,8 +205,16 @@ function initSockets(io) {
     // ---------------- ASTROLOGER AGORA CALL & CHAT SIGNALING ----------------
     socket.on('astro:call:initiate', (payload) => {
       const { channelName, recipientId, caller, mode } = payload || {};
-      console.log(`📞 [Astro Consultation] Initiating ${mode} from ${caller?.name} on channel ${channelName}`);
-      
+      const requestedId = recipientId ? String(recipientId) : null;
+      console.log(`📞 [Astro Consultation] Initiating ${mode} from ${caller?.name} -> target=${requestedId || 'AUTO'} on channel ${channelName}`);
+
+      if (caller?.id) {
+        socket.join(`user:${caller.id}`);
+      }
+      if (channelName) {
+        socket.join(`channel:${channelName}`);
+      }
+
       let enrichedPayload = { ...payload };
       try {
         if (channelName) {
@@ -147,25 +230,111 @@ function initSockets(io) {
         console.warn('⚠️ Agora token generation error in astro:call:initiate:', err.message);
       }
 
-      if (recipientId) {
-        io.to(`vendor:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
-        io.to(`pandit:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
-        io.to(`user:${recipientId}`).emit('astro:call:incoming', enrichedPayload);
-      } else {
-        io.emit('astro:call:incoming', enrichedPayload);
+      const liveList = getLiveAstrologers(io);
+      const exactOnlineAstro = requestedId
+        ? liveList.find((p) => String(p.id) === requestedId || String(p.vendorId) === requestedId)
+        : null;
+      const isDirectAstroRoom = requestedId
+        ? isSocketRoomActiveInRole(io, `vendor:${requestedId}`, 'role:astro') ||
+          isSocketRoomActiveInRole(io, `pandit:${requestedId}`, 'role:astro')
+        : false;
+
+      if (exactOnlineAstro || isDirectAstroRoom) {
+        emitOnceToRooms(
+          io,
+          [`vendor:${requestedId}`, `pandit:${requestedId}`, `user:${requestedId}`, exactOnlineAstro?.socketId],
+          'astro:call:incoming',
+          {
+            ...enrichedPayload,
+            recipientId: requestedId,
+            routedAstrologer: exactOnlineAstro || undefined,
+          }
+        );
+        return;
+      }
+
+      // Requested astrologer is offline or not visible -> automatically route to any online astrologer
+      const modeKey = mode === 'chat' ? 'chatOnline' : mode === 'audio' ? 'audioOnline' : 'videoOnline';
+      const fallbackAstro =
+        liveList.find((p) => !p.presence || p.presence[modeKey] !== false) || liveList[0] || null;
+
+      if (fallbackAstro) {
+        const routedPayload = {
+          ...enrichedPayload,
+          recipientId: fallbackAstro.id,
+          originalRecipientId: requestedId,
+          isFallbackRouted: true,
+          routedAstrologer: {
+            id: fallbackAstro.id,
+            name: fallbackAstro.name,
+            nameHi: fallbackAstro.nameHi,
+            title: fallbackAstro.title,
+            rates: fallbackAstro.rates,
+          },
+        };
+        console.log(
+          `🔁 [Smart Astro Routing] Requested=${requestedId || 'none'} unavailable -> routing to online partner ${fallbackAstro.name} (${fallbackAstro.id})`
+        );
+        emitOnceToRooms(
+          io,
+          ['role:astro', `vendor:${fallbackAstro.id}`, `pandit:${fallbackAstro.id}`, fallbackAstro.socketId],
+          'astro:call:incoming',
+          routedPayload
+        );
+        const routeNotice = {
+          channelName,
+          originalRecipientId: requestedId,
+          recipientId: fallbackAstro.id,
+          astrologer: routedPayload.routedAstrologer,
+        };
+        socket.emit('astro:call:routed', routeNotice);
+        if (caller?.id) {
+          io.to(`user:${caller.id}`).emit('astro:call:routed', routeNotice);
+        }
+        return;
+      }
+
+      // Check if any socket is sitting in role:astro without cached entry
+      if (isRoomOccupied(io, 'role:astro')) {
+        io.to('role:astro').emit('astro:call:incoming', enrichedPayload);
+        return;
+      }
+
+      console.log(`⚠️ [Astro Consultation] No online astrologer available for channel ${channelName}`);
+      const unavailablePayload = {
+        channelName,
+        recipientId: requestedId,
+        message: 'वर्तमान में कोई भी ज्योतिषी ऑनलाइन उपलब्ध नहीं है।',
+      };
+      socket.emit('astro:call:unavailable', unavailablePayload);
+      if (caller?.id) {
+        io.to(`user:${caller.id}`).emit('astro:call:unavailable', unavailablePayload);
       }
     });
 
     socket.on('astro:call:accept', (payload) => {
-      const { channelName, callerId } = payload || {};
-      console.log(`✅ [Astro Consultation] Accepted for channel ${channelName}`);
+      const { channelName, callerId, vendorId, sessionId } = payload || {};
+      const responderId = vendorId || socket.partnerAstroId;
+      console.log(`✅ [Astro Consultation] Accepted for channel ${channelName} by ${responderId || 'astro'}`);
 
-      let enrichedPayload = { ...payload };
+      if (channelName) {
+        socket.join(`channel:${channelName}`);
+      }
+      if (sessionId) {
+        socket.join(`session:${sessionId}`);
+      }
+
+      const matchedPartner = responderId ? activeAstroPartners.get(String(responderId)) : null;
+      let enrichedPayload = {
+        ...payload,
+        vendorId: responderId,
+        astrologer: payload?.astrologer || matchedPartner || undefined,
+      };
       try {
         if (channelName) {
           const agoraData = generateRtcToken({ channelName, role: 'publisher' });
           enrichedPayload = {
-            ...payload,
+            ...enrichedPayload,
             agoraAppId: agoraData.appId,
             agoraToken: agoraData.token,
             agoraMode: agoraData.mode,
@@ -175,97 +344,133 @@ function initSockets(io) {
         console.warn('⚠️ Agora token generation error in astro:call:accept:', err.message);
       }
 
-      if (callerId) {
-        io.to(`user:${callerId}`).emit('astro:call:connected', enrichedPayload);
+      const targetRooms = [];
+      if (callerId) targetRooms.push(`user:${callerId}`);
+      if (channelName) targetRooms.push(`channel:${channelName}`);
+      if (targetRooms.length > 0) {
+        emitOnceToRooms(io, targetRooms, 'astro:call:connected', enrichedPayload);
       } else {
         io.emit('astro:call:connected', enrichedPayload);
+      }
+      if (channelName) {
+        // Dismiss ringing popup on any other online astrologers if call was broadcast to role:astro
+        socket.to('role:astro').emit('astro:call:taken', { channelName, acceptedBy: responderId });
       }
     });
 
     socket.on('astro:call:decline', (payload) => {
-      const { callerId } = payload || {};
-      if (callerId) {
-        io.to(`user:${callerId}`).emit('astro:call:declined', payload);
+      const { callerId, channelName } = payload || {};
+      const targetRooms = [];
+      if (channelName) targetRooms.push(`channel:${channelName}`);
+      if (callerId) targetRooms.push(`user:${callerId}`);
+      if (targetRooms.length > 0) {
+        emitOnceToRooms(io, targetRooms, 'astro:call:declined', payload);
       } else {
         io.emit('astro:call:declined', payload);
       }
     });
 
     socket.on('astro:call:end', (payload) => {
-      const { callerId, recipientId } = payload || {};
-      if (callerId) io.to(`user:${callerId}`).emit('astro:call:ended', payload);
-      if (recipientId) io.to(`vendor:${recipientId}`).emit('astro:call:ended', payload);
-      io.emit('astro:call:ended', payload);
-    });
-
-    socket.on('astro:chat:send', (payload) => {
-      const { sessionId, recipientId } = payload || {};
-      if (recipientId) {
-        io.to(`user:${recipientId}`).emit('astro:chat:message', payload);
-        io.to(`vendor:${recipientId}`).emit('astro:chat:message', payload);
-      } else if (sessionId) {
-        io.to(`session:${sessionId}`).emit('astro:chat:message', payload);
+      const { callerId, recipientId, channelName } = payload || {};
+      const targetRooms = [];
+      if (channelName) targetRooms.push(`channel:${channelName}`);
+      if (callerId) targetRooms.push(`user:${callerId}`);
+      if (recipientId) targetRooms.push(`vendor:${recipientId}`, `pandit:${recipientId}`);
+      if (targetRooms.length > 0) {
+        emitOnceToRooms(io, targetRooms, 'astro:call:ended', payload);
       } else {
-        io.emit('astro:chat:message', payload);
+        io.emit('astro:call:ended', payload);
       }
     });
 
-    socket.on('astro:online', (data) => {
-      const partnerId = String(data?.id || data?.vendorId || id || socket.id);
-      const astro = {
-        id: partnerId,
-        vendorId: partnerId,
-        name: data?.name || 'पंडित जी (Live Partner)',
-        nameHi: data?.nameHi || data?.name || 'पंडित जी (Live Partner)',
-        title: data?.title || 'सत्यापित वैदिक ज्योतिषी • पार्टनर ऐप लाइव',
-        photo: data?.photo || 'pandit_varanasi',
-        rating: Number(data?.rating || 5.0),
-        reviewsCount: Number(data?.reviewsCount || 160),
-        experienceYears: Number(data?.experienceYears || 15),
-        skills: Array.isArray(data?.skills) && data.skills.length ? data.skills : ['Vedic', 'KP Astrology', 'Kundli', 'Numerology'],
-        languages: Array.isArray(data?.languages) ? data.languages : ['हिंदी', 'संस्कृत', 'English'],
-        chatRate: Number(data?.rates?.chat || data?.chatRate || 5),
-        audioRate: Number(data?.rates?.audio || data?.audioRate || 5),
-        videoRate: Number(data?.rates?.video || data?.videoRate || 5),
-        rates: {
-          chat: Number(data?.rates?.chat || 5),
-          audio: Number(data?.rates?.audio || 5),
-          video: Number(data?.rates?.video || 5),
-        },
-        isOnline: data?.isOnline !== false,
-        ordersCompleted: 620,
-        totalMinutes: 7400,
-        bio: data?.bio || 'वैदिक संस्कार पार्टनर ऐप से सीधे लाइव कनेक्टेड ज्योतिषी।',
-        socketId: socket.id,
-        connectedAt: Date.now(),
-      };
-      activeAstroPartners.set(partnerId, astro);
-      socket.partnerAstroId = partnerId;
+    socket.on('astro:chat:send', (payload) => {
+      const { sessionId, channelName, recipientId } = payload || {};
+      if (channelName) socket.join(`channel:${channelName}`);
+      if (sessionId) socket.join(`session:${sessionId}`);
 
-      console.log(`🌟 [Live Socket] Partner Online Registered: ${astro.name} (${partnerId})`);
-      io.emit('astro:online', astro);
-      io.emit('astro:presence', astro);
-      io.emit('astro:list', Array.from(activeAstroPartners.values()));
+      const targetRooms = [];
+      if (channelName) targetRooms.push(`channel:${channelName}`);
+      if (sessionId) targetRooms.push(`session:${sessionId}`);
+      if (recipientId) {
+        targetRooms.push(`user:${recipientId}`, `vendor:${recipientId}`, `pandit:${recipientId}`);
+      }
+      if (targetRooms.length > 0) {
+        emitOnceToRooms(io, targetRooms, 'astro:chat:message', payload, socket.id);
+      } else {
+        socket.broadcast.emit('astro:chat:message', payload);
+      }
     });
 
-    socket.on('astro:presence', (data) => {
-      const partnerId = String(data?.id || data?.vendorId || socket.partnerAstroId || id);
+    const registerOrUpdateAstroPartner = (data, defaultOnline = true) => {
+      const partnerId = String(data?.id || data?.vendorId || socket.partnerAstroId || id || socket.id);
+      const isOnlineFlag = data?.isOnline !== undefined ? data.isOnline !== false : defaultOnline;
+      if (!isOnlineFlag) {
+        markAstroOffline(io, socket, partnerId);
+        return;
+      }
+
       const existing = activeAstroPartners.get(partnerId) || {};
-      const updated = {
+      const mergedRates = {
+        chat: Number(data?.rates?.chat ?? data?.chatRate ?? existing?.rates?.chat ?? 5),
+        audio: Number(data?.rates?.audio ?? data?.audioRate ?? existing?.rates?.audio ?? 5),
+        video: Number(data?.rates?.video ?? data?.videoRate ?? existing?.rates?.video ?? 5),
+      };
+      const astro = {
         ...existing,
         ...data,
         id: partnerId,
-        isOnline: data?.isOnline !== false,
+        vendorId: partnerId,
+        name: data?.name || existing.name || 'पंडित जी (Live Partner)',
+        nameHi: data?.nameHi || data?.name || existing.nameHi || existing.name || 'पंडित जी (Live Partner)',
+        title: data?.title || existing.title || 'सत्यापित वैदिक ज्योतिषी • पार्टनर ऐप लाइव',
+        photo: data?.photo || existing.photo || 'pandit_varanasi',
+        rating: Number(data?.rating || existing.rating || 5.0),
+        reviewsCount: Number(data?.reviewsCount || existing.reviewsCount || 160),
+        experienceYears: Number(data?.experienceYears || existing.experienceYears || 15),
+        skills: Array.isArray(data?.skills) && data.skills.length
+          ? data.skills
+          : existing.skills || ['Vedic', 'KP Astrology', 'Kundli', 'Numerology'],
+        languages: Array.isArray(data?.languages)
+          ? data.languages
+          : existing.languages || ['हिंदी', 'संस्कृत', 'English'],
+        chatRate: mergedRates.chat,
+        audioRate: mergedRates.audio,
+        videoRate: mergedRates.video,
+        rates: mergedRates,
+        isOnline: true,
+        ordersCompleted: existing.ordersCompleted || 620,
+        totalMinutes: existing.totalMinutes || 7400,
+        bio: data?.bio || existing.bio || 'वैदिक संस्कार पार्टनर ऐप से सीधे लाइव कनेक्टेड ज्योतिषी।',
+        socketId: socket.id,
+        connectedAt: existing.connectedAt || Date.now(),
       };
-      activeAstroPartners.set(partnerId, updated);
-      console.log(`🌟 [Live Socket] Astrologer Presence Updated: ${updated.name || partnerId} (${updated.isOnline ? 'ONLINE' : 'OFFLINE'})`);
-      io.emit('astro:presence', updated);
-      io.emit('astro:online', updated);
-      io.emit('astro:list', Array.from(activeAstroPartners.values()));
+      activeAstroPartners.set(partnerId, astro);
+      socket.partnerAstroId = partnerId;
+      socket.join('role:astro');
+      socket.join(`vendor:${partnerId}`);
+      socket.join(`pandit:${partnerId}`);
+
+      console.log(`🌟 [Live Socket] Astro Partner Online: ${astro.name} (${partnerId})`);
+      io.emit('astro:online', astro);
+      io.emit('astro:presence', astro);
+      io.emit('astro:list', getLiveAstrologers(io));
+    };
+
+    socket.on('astro:online', (data) => {
+      registerOrUpdateAstroPartner(data, true);
+    });
+
+    socket.on('astro:presence', (data) => {
+      registerOrUpdateAstroPartner(data, data?.isOnline !== false);
+    });
+
+    socket.on('astro:offline', (data) => {
+      const partnerId = data?.id || data?.vendorId || socket.partnerAstroId || id;
+      markAstroOffline(io, socket, partnerId);
     });
 
     socket.on('astro:get:online', () => {
-      socket.emit('astro:list', Array.from(activeAstroPartners.values()));
+      socket.emit('astro:list', getLiveAstrologers(io));
     });
 
     // Pandit accepts broadcast
