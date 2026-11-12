@@ -1,9 +1,73 @@
 const router = require('express').Router();
 const multer = require('multer');
 const store = require('../store');
-const { requireAuth } = require('../auth');
+const { requireAuth, extractAuthClaims } = require('../auth');
 const { emit, getLiveAstrologers } = require('../sockets');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
+
+function resolvePartnerIdFromReq(req) {
+  const claims = extractAuthClaims(req);
+  if (claims && claims.role !== 'customer' && claims.role !== 'user' && claims.role !== 'admin') {
+    if (claims.sub) return String(claims.sub);
+  }
+  const explicit = req.query?.vendorId || req.query?.id || req.body?.vendorId;
+  return explicit ? String(explicit) : null;
+}
+
+function getPartnerEarningsSummary(vendorId) {
+  if (!vendorId) {
+    return { walletBalance: 0, totalEarned: 0, expectedEarnings: 0, paidOut: 0, transactions: [] };
+  }
+  const vendor = store.get('vendors', vendorId);
+  const earningsList = store
+    .list('vendor_earnings')
+    .filter((e) => String(e.vendorId) === String(vendorId));
+  const payoutsList = store
+    .list('payouts')
+    .filter((p) => String(p.vendorId) === String(vendorId));
+
+  const totalEarned = earningsList.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
+  const totalPaid = payoutsList.reduce((sum, p) => sum + (Number(p.amount) || 0), 0);
+  const walletBalance =
+    vendor?.walletBalance != null
+      ? Math.max(0, Number(vendor.walletBalance))
+      : Math.max(0, totalEarned - totalPaid);
+
+  const activeBookings = store.list('bookings').filter(
+    (b) =>
+      String(b.assignedVendorId || b.panditId || '') === String(vendorId) &&
+      b.status !== 'COMPLETED' &&
+      b.status !== 'CANCELLED' &&
+      b.status !== 'EXPIRED'
+  );
+  const expectedEarnings = activeBookings.reduce(
+    (sum, b) => sum + Math.round(Number(b.totalAmount || b.amount || 0) * 0.85),
+    0
+  );
+
+  const credits = earningsList.map((e) => ({
+    id: e.id || `earn_${e.bookingId || Date.now()}`,
+    type: 'credit',
+    title: e.title || (e.bookingId ? `Pooja #${e.bookingId}` : 'Live Service Earning'),
+    sub: e.sub || new Date(e.createdAt || Date.now()).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+    amount: Number(e.amount || 0),
+    createdAt: e.createdAt || new Date().toISOString(),
+  }));
+  const debits = payoutsList.map((p) => ({
+    id: p.id || `pay_${Date.now()}`,
+    type: 'debit',
+    title: p.upiId ? `UPI Payout (${p.upiId})` : 'Bank/UPI Withdrawal',
+    sub: new Date(p.createdAt || Date.now()).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' }),
+    amount: -Math.abs(Number(p.amount || 0)),
+    createdAt: p.createdAt || new Date().toISOString(),
+  }));
+
+  const transactions = [...credits, ...debits].sort(
+    (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+  );
+
+  return { walletBalance, totalEarned, expectedEarnings, paidOut: totalPaid, transactions };
+}
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -297,14 +361,23 @@ router.get('/pandit/puja-services', (req, res) => {
 });
 
 router.get(['/wallet', '/wallet/balance'], (req, res) => {
-  const vendorId = req.auth?.sub || req.query.vendorId;
-  const vendor = vendorId ? store.get('vendors', vendorId) : null;
-  const balance = vendor?.walletBalance != null ? Number(vendor.walletBalance) : 1500;
-  res.json({ success: true, balance, data: { balance } });
+  const vendorId = resolvePartnerIdFromReq(req);
+  const summary = getPartnerEarningsSummary(vendorId);
+  res.json({
+    success: true,
+    balance: summary.walletBalance,
+    walletBalance: summary.walletBalance,
+    totalEarned: summary.totalEarned,
+    expectedEarnings: summary.expectedEarnings,
+    transactions: summary.transactions,
+    data: summary,
+  });
 });
 
 router.get('/wallet/transactions', (req, res) => {
-  res.json({ success: true, transactions: [], data: [] });
+  const vendorId = resolvePartnerIdFromReq(req);
+  const { transactions } = getPartnerEarningsSummary(vendorId);
+  res.json({ success: true, transactions, data: transactions });
 });
 
 router.get(['/store/home', '/store/categories', '/store/products'], (req, res) => {
@@ -408,10 +481,10 @@ function getVendorDetails(req) {
     vendorDetails: {
       id: vendor?.id || vendorId || 'pandit_1',
       name: vendor?.name || req.auth?.name || req.body.vendorName || 'Acharya Raman Shastri',
-      rating: vendor?.rating != null ? Number(vendor.rating) : 5.0,
-      reviewsCount: vendor?.jobs || 124,
+      rating: vendor?.rating != null ? Number(vendor.rating) : 0,
+      reviewsCount: Number(vendor?.reviewsCount ?? vendor?.jobs ?? 0),
       photo: vendor?.photo || req.body.photo || null,
-      experienceYears: vendor?.experience || 8,
+      experienceYears: Number(vendor?.experienceYears ?? vendor?.experience ?? 0),
     },
   };
 }
@@ -639,29 +712,31 @@ router.post('/job/complete', (req, res) => {
 });
 
 router.get('/bookings', (req, res) => {
-  const vendorId = req.auth?.sub || req.query.vendorId || req.query.id;
-  const all = store.list('bookings');
-  let list = all;
-  if (vendorId) {
-    list = all.filter(
-      (b) =>
-        b.assignedVendorId === vendorId ||
-        b.panditId === vendorId ||
-        (b.assignedVendor && b.assignedVendor.id === vendorId)
-    );
+  const vendorId = resolvePartnerIdFromReq(req);
+  if (!vendorId) {
+    return res.json({ success: true, count: 0, bookings: [], data: [] });
   }
+  const all = store.list('bookings');
+  const list = all.filter(
+    (b) =>
+      String(b.assignedVendorId || '') === vendorId ||
+      String(b.panditId || '') === vendorId ||
+      String(b.assignedVendor?.id || '') === vendorId
+  );
   const sanitized = list.map((b) => bookingStateMachine.sanitizeForVendor(b, true));
   res.json({ success: true, count: sanitized.length, bookings: sanitized, data: sanitized });
 });
 
 router.get('/bookings/active', (req, res) => {
-  const vendorId = req.auth?.sub || req.query.vendorId;
+  const vendorId = resolvePartnerIdFromReq(req);
+  if (!vendorId) return res.json({ success: true, booking: null, data: null });
   const all = store.list('bookings');
   const active = all.find(
     (b) =>
-      (!vendorId || b.assignedVendorId === vendorId) &&
+      String(b.assignedVendorId || b.panditId || '') === vendorId &&
       b.status !== 'COMPLETED' &&
-      b.status !== 'CANCELLED'
+      b.status !== 'CANCELLED' &&
+      b.status !== 'EXPIRED'
   );
   if (!active) return res.json({ success: true, booking: null, data: null });
   res.json({
@@ -674,7 +749,7 @@ router.get('/bookings/active', (req, res) => {
 router.get('/bookings/:id', (req, res) => {
   const b = store.get('bookings', req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
-  const vendorId = req.auth?.sub || req.query.vendorId;
+  const vendorId = resolvePartnerIdFromReq(req);
   const isAssigned = !vendorId || b.assignedVendorId === vendorId;
   res.json({
     success: true,
@@ -685,39 +760,79 @@ router.get('/bookings/:id', (req, res) => {
 
 /* ---------- Vendor Wallet, Ledger & Earnings ---------- */
 router.get('/earnings', (req, res) => {
-  const vendorId = req.auth?.sub || req.query.vendorId || req.query.id;
-  const earningsList = store.list('vendor_earnings').filter((e) => !vendorId || e.vendorId === vendorId);
-  const totalEarned = earningsList.reduce((sum, e) => sum + (Number(e.amount) || 0), 0);
-  const vendor = vendorId ? store.get('vendors', vendorId) : null;
-  const walletBalance = vendor?.walletBalance != null ? Number(vendor.walletBalance) : totalEarned;
+  const vendorId = resolvePartnerIdFromReq(req);
+  const summary = getPartnerEarningsSummary(vendorId);
 
   res.json({
     success: true,
-    walletBalance,
-    totalEarned,
-    expectedEarnings: 0,
-    transactions: earningsList,
-    data: {
-      walletBalance,
-      totalEarned,
-      transactions: earningsList,
+    walletBalance: summary.walletBalance,
+    totalEarned: summary.totalEarned,
+    expectedEarnings: summary.expectedEarnings,
+    transactions: summary.transactions,
+    earnings: {
+      available: summary.walletBalance,
+      pending: summary.walletBalance,
+      expected: summary.expectedEarnings,
+      total: summary.totalEarned,
+      transactions: summary.transactions,
     },
+    data: summary,
   });
 });
 
+router.post('/earnings/credit', (req, res) => {
+  const vendorId = resolvePartnerIdFromReq(req);
+  const amount = Number(req.body?.amount || 0);
+  if (!vendorId || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ success: false, message: 'Valid vendorId and amount required' });
+  }
+  const vendor = store.get('vendors', vendorId);
+  const title = req.body?.title || req.body?.reason || 'Astro Consultation Earning';
+  const sessionId = req.body?.sessionId || null;
+
+  if (sessionId) {
+    const dup = store.list('vendor_earnings').find(
+      (e) => String(e.vendorId) === vendorId && String(e.sessionId) === String(sessionId)
+    );
+    if (dup) {
+      const summary = getPartnerEarningsSummary(vendorId);
+      return res.json({ success: true, duplicate: true, ...summary });
+    }
+  }
+
+  const rec = store.insert('vendor_earnings', {
+    vendorId,
+    sessionId,
+    title,
+    amount: Math.round(amount * 100) / 100,
+    status: 'Settled',
+    createdAt: new Date().toISOString(),
+  });
+
+  if (vendor) {
+    const nextBal = Number(vendor.walletBalance || 0) + Number(rec.amount || 0);
+    const nextTotal = Number(vendor.totalEarned || 0) + Number(rec.amount || 0);
+    store.update('vendors', vendor.id, { walletBalance: nextBal, totalEarned: nextTotal });
+  }
+
+  const summary = getPartnerEarningsSummary(vendorId);
+  emit.toVendor(vendorId, 'earnings:updated', { vendorId, ...summary, transaction: rec });
+  res.status(201).json({ success: true, transaction: rec, ...summary });
+});
+
 router.post('/earnings/payout', (req, res) => {
-  const vendorId = req.auth?.sub || req.body.vendorId;
+  const vendorId = resolvePartnerIdFromReq(req);
   const amount = Number(req.body.amount || req.body.payoutAmount);
-  if (!amount || amount <= 0) {
+  if (!vendorId || !amount || amount <= 0) {
     return res.status(400).json({ success: false, message: 'Invalid payout amount' });
   }
-  const vendor = vendorId ? store.get('vendors', vendorId) : null;
-  const currentBal = Number(vendor?.walletBalance || 0);
+  const vendor = store.get('vendors', vendorId);
+  const { walletBalance: currentBal } = getPartnerEarningsSummary(vendorId);
   if (currentBal < amount) {
     return res.status(400).json({ success: false, message: 'Insufficient wallet balance' });
   }
 
-  const updatedBal = currentBal - amount;
+  const updatedBal = Math.max(0, currentBal - amount);
   if (vendor) {
     store.update('vendors', vendor.id, { walletBalance: updatedBal });
   }
@@ -725,16 +840,21 @@ router.post('/earnings/payout', (req, res) => {
   const payoutRecord = store.insert('payouts', {
     vendorId: vendor?.id || vendorId,
     vendorName: vendor?.name || 'Partner',
+    upiId: req.body?.upiId || vendor?.upiId || null,
     amount,
     status: 'Processed',
     createdAt: new Date().toISOString(),
   });
 
+  const summary = getPartnerEarningsSummary(vendorId);
+  emit.toVendor(vendorId, 'earnings:updated', { vendorId, ...summary });
+
   res.json({
     success: true,
     message: 'Payout processed successfully',
     payout: payoutRecord,
-    walletBalance: updatedBal,
+    walletBalance: summary.walletBalance,
+    transactions: summary.transactions,
   });
 });
 

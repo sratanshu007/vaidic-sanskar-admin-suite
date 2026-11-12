@@ -371,7 +371,47 @@ function initSockets(io) {
     });
 
     socket.on('astro:call:end', (payload) => {
-      const { callerId, recipientId, channelName } = payload || {};
+      const { callerId, recipientId, vendorId, channelName, sessionId, durationSeconds, ratePerMinute, mode } = payload || {};
+      const targetVendor = vendorId || recipientId;
+      const secs = Number(durationSeconds || 0);
+      if (targetVendor && secs > 0) {
+        try {
+          const store = require('./store');
+          const key = sessionId || channelName;
+          const dup = key
+            ? store.list('vendor_earnings').find((e) => String(e.vendorId) === String(targetVendor) && String(e.sessionId) === String(key))
+            : null;
+          if (!dup) {
+            const billedMins = Math.max(1, Math.ceil(secs / 60));
+            const gross = billedMins * Number(ratePerMinute || 5);
+            const net = Math.round(gross * 0.85 * 100) / 100;
+            const rec = store.insert('vendor_earnings', {
+              vendorId: String(targetVendor),
+              sessionId: key || undefined,
+              title: `Astro ${mode || 'Consultation'} (${billedMins} min)`,
+              amount: net,
+              status: 'Settled',
+              createdAt: new Date().toISOString(),
+            });
+            const v = store.get('vendors', String(targetVendor));
+            if (v) {
+              const nextBal = Number(v.walletBalance || 0) + net;
+              const nextTotal = Number(v.totalEarned || 0) + net;
+              store.update('vendors', v.id, { walletBalance: nextBal, totalEarned: nextTotal });
+              io.to(`vendor:${v.id}`).emit('earnings:updated', {
+                vendorId: v.id,
+                walletBalance: nextBal,
+                totalEarned: nextTotal,
+                netEarning: net,
+                transaction: rec,
+              });
+            }
+          }
+        } catch (err) {
+          console.warn('⚠️ Astro live earning record notice:', err.message);
+        }
+      }
+
       const targetRooms = [];
       if (channelName) targetRooms.push(`channel:${channelName}`);
       if (callerId) targetRooms.push(`user:${callerId}`);
@@ -424,9 +464,9 @@ function initSockets(io) {
         nameHi: data?.nameHi || data?.name || existing.nameHi || existing.name || 'पंडित जी (Live Partner)',
         title: data?.title || existing.title || 'सत्यापित वैदिक ज्योतिषी • पार्टनर ऐप लाइव',
         photo: data?.photo || existing.photo || 'pandit_varanasi',
-        rating: Number(data?.rating || existing.rating || 5.0),
-        reviewsCount: Number(data?.reviewsCount || existing.reviewsCount || 160),
-        experienceYears: Number(data?.experienceYears || existing.experienceYears || 15),
+        rating: Number(data?.rating ?? existing.rating ?? 0),
+        reviewsCount: Number(data?.reviewsCount ?? existing.reviewsCount ?? 0),
+        experienceYears: Number(data?.experienceYears ?? existing.experienceYears ?? 0),
         skills: Array.isArray(data?.skills) && data.skills.length
           ? data.skills
           : existing.skills || ['Vedic', 'KP Astrology', 'Kundli', 'Numerology'],
@@ -438,8 +478,8 @@ function initSockets(io) {
         videoRate: mergedRates.video,
         rates: mergedRates,
         isOnline: true,
-        ordersCompleted: existing.ordersCompleted || 620,
-        totalMinutes: existing.totalMinutes || 7400,
+        ordersCompleted: Number(data?.ordersCompleted ?? existing.ordersCompleted ?? 0),
+        totalMinutes: Number(data?.totalMinutes ?? existing.totalMinutes ?? 0),
         bio: data?.bio || existing.bio || 'वैदिक संस्कार पार्टनर ऐप से सीधे लाइव कनेक्टेड ज्योतिषी।',
         socketId: socket.id,
         connectedAt: existing.connectedAt || Date.now(),

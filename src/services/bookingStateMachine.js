@@ -72,10 +72,10 @@ function sanitizeForUser(booking) {
     clone.pandit = {
       id: v.id,
       name: v.name || v.displayName || 'Pandit Ji',
-      rating: v.rating || 4.9,
-      reviewsCount: v.reviewsCount || 124,
+      rating: v.rating != null ? Number(v.rating) : 0,
+      reviewsCount: Number(v.reviewsCount ?? 0),
       photo: v.photo || v.photoUrl || null,
-      experienceYears: v.experienceYears || 8,
+      experienceYears: Number(v.experienceYears ?? 0),
       verified: true,
       // Personal phone number is intentionally omitted
     };
@@ -247,12 +247,12 @@ const bookingStateMachine = {
       booking.updatedAt = new Date().toISOString();
       booking.assignedVendor = {
         id: vendorId,
-        name: vendorDetails.name || 'पं. शशिकांत शास्त्री',
-        rating: vendorDetails.rating != null ? Number(vendorDetails.rating) : 4.9,
-        reviewsCount: vendorDetails.reviewsCount || 142,
+        name: vendorDetails.name || 'Pandit Ji',
+        rating: vendorDetails.rating != null ? Number(vendorDetails.rating) : 0,
+        reviewsCount: Number(vendorDetails.reviewsCount ?? 0),
         photo: vendorDetails.photo || null,
-        experienceYears: vendorDetails.experienceYears || 10,
-        gurukul: vendorDetails.gurukul || 'सम्पूर्णानन्द संस्कृत विश्वविद्यालय, वाराणसी',
+        experienceYears: Number(vendorDetails.experienceYears ?? 0),
+        gurukul: vendorDetails.gurukul || '',
       };
       booking.pandit = booking.assignedVendor;
 
@@ -566,19 +566,50 @@ const bookingStateMachine = {
     if (!booking.tracking) booking.tracking = {};
     booking.tracking.isSharingStopped = true;
 
-    const netEarning = Math.round((Number(booking.totalAmount || booking.amount || 2500)) * 0.85);
-    store.insert('vendor_earnings', {
-      vendorId: booking.assignedVendorId || vendorId || 'V9501',
-      bookingId: booking.id,
-      amount: netEarning,
-      status: 'Settled',
-      createdAt: new Date().toISOString(),
-    });
+    const targetVendorId = booking.assignedVendorId || vendorId || null;
+    const netEarning = Math.round((Number(booking.totalAmount || booking.amount || 0)) * 0.85);
+    let earningRec = null;
+    let nextBal = 0;
+    let nextEarned = 0;
+
+    if (targetVendorId) {
+      earningRec = store.insert('vendor_earnings', {
+        vendorId: targetVendorId,
+        bookingId: booking.id,
+        title: `${booking.pooja?.name || booking.ritualName || 'Pooja'} #${booking.id}`,
+        amount: netEarning,
+        status: 'Settled',
+        createdAt: new Date().toISOString(),
+      });
+
+      const vendorRec = store.get('vendors', targetVendorId);
+      if (vendorRec) {
+        nextBal = Number(vendorRec.walletBalance || 0) + netEarning;
+        nextEarned = Number(vendorRec.totalEarned || 0) + netEarning;
+        const nextJobs = Number(vendorRec.jobs || 0) + 1;
+        store.update('vendors', vendorRec.id, {
+          walletBalance: nextBal,
+          totalEarned: nextEarned,
+          jobs: nextJobs,
+          completedPoojaCount: Number(vendorRec.completedPoojaCount || 0) + 1,
+        });
+      }
+    }
 
     store.update('bookings', booking.id, booking);
 
     emit.toUser(booking.userId, 'booking:completed', sanitizeForUser(booking));
     emit.all(`booking:${booking.id}`, { event: 'booking:completed', booking: sanitizeForUser(booking) });
+    if (targetVendorId) {
+      emit.toVendor(targetVendorId, 'earnings:updated', {
+        vendorId: targetVendorId,
+        bookingId: booking.id,
+        netEarning,
+        walletBalance: nextBal,
+        totalEarned: nextEarned,
+        transaction: earningRec,
+      });
+    }
 
     return {
       success: true,

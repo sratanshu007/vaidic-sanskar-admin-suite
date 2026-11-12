@@ -1,7 +1,49 @@
 const router = require('express').Router();
 const store = require('../store');
-const { requireAuth } = require('../auth');
+const { requireAuth, extractAuthClaims } = require('../auth');
 const { emit } = require('../sockets');
+
+function getUserFilterKeys(req) {
+  const claims = extractAuthClaims(req);
+  const raw = [
+    claims?.sub,
+    claims?.id,
+    claims?.email,
+    req.query?.userId,
+    req.query?.email,
+    req.body?.userId,
+  ];
+  const ignored = new Set(['guest_user', 'anonymous', 'admin@vaidicsanskar.com', 'super admin', 'devotee']);
+  const keys = Array.from(
+    new Set(
+      raw
+        .filter((v) => v !== undefined && v !== null)
+        .map((v) => String(v).trim().toLowerCase())
+        .filter((v) => v && !ignored.has(v))
+    )
+  );
+  return { claims, keys };
+}
+
+function recordMatchesUser(rec, keys, claims) {
+  if (!rec || !keys.length) return false;
+  const candidates = [
+    rec.userId,
+    rec.userEmail,
+    rec.email,
+    rec.buyerId,
+    rec.user?.id,
+    rec.user?._id,
+    rec.user?.email,
+  ]
+    .filter(Boolean)
+    .map((v) => String(v).trim().toLowerCase());
+  if (candidates.some((c) => keys.includes(c))) return true;
+  if (!rec.userId && !rec.buyerId && claims?.name && rec.buyer) {
+    return String(rec.buyer).trim().toLowerCase() === String(claims.name).trim().toLowerCase();
+  }
+  return false;
+}
 
 /* ---------- Catalog & Discovery (Only Approved Partners Visible to Users) ---------- */
 function getApprovedVendors(roleFilter) {
@@ -78,15 +120,18 @@ router.get(['/store/products/:id', '/estore/products/:id'], (req, res) => {
 
 /* ---------- E-Store Checkout & Orders ---------- */
 router.post(['/store/checkout', '/estore/checkout', '/store/orders'], (req, res) => {
+  const claims = extractAuthClaims(req);
   const body = req.body || {};
   const orderId = 'ORD-' + Math.floor(1000 + Math.random() * 9000);
   const items = Array.isArray(body.items) ? body.items : [];
-  const buyerName = body.shippingAddress?.name || req.auth?.name || 'श्रद्धेय यजमान';
+  const buyerName = body.shippingAddress?.name || claims?.name || 'श्रद्धेय यजमान';
   const firstItem = items[0]?.name || body.itemName || 'वैदिक पूजा सामग्री किट';
-  const totalAmt = Number(body.total || body.amount || (items[0]?.price ? items[0].price * (items[0]?.quantity || 1) : 850));
+  const totalAmt = Number(body.total || body.amount || (items[0]?.price ? items[0].price * (items[0]?.quantity || 1) : 0));
 
   const newOrder = store.insert('orders', {
     id: orderId,
+    userId: claims?.sub || body.userId || null,
+    userEmail: claims?.email || body.userEmail || null,
     buyer: buyerName,
     item: firstItem,
     merchant: 'Vaidic Sanskar Official',
@@ -115,7 +160,9 @@ router.post(['/store/checkout', '/estore/checkout', '/store/orders'], (req, res)
 });
 
 router.get(['/store/orders', '/estore/orders'], (req, res) => {
-  const orders = store.list('orders');
+  const { claims, keys } = getUserFilterKeys(req);
+  const all = store.list('orders');
+  const orders = keys.length ? all.filter((o) => recordMatchesUser(o, keys, claims)) : [];
   res.json({ success: true, count: orders.length, orders, data: orders });
 });
 
@@ -132,8 +179,14 @@ const bookingStateMachine = require('../services/bookingStateMachine');
 
 /* ---------- Bookings (Uber/Rapido Pooja Engine) ---------- */
 router.post(['/booking/create', '/bookings/create', '/bookings', '/instant/request'], (req, res) => {
-  const userId = req.auth?.name || req.auth?.sub || req.body.userId || 'guest_user';
-  const booking = bookingStateMachine.createBooking(req.body, userId);
+  const claims = extractAuthClaims(req);
+  const userId = claims?.sub || req.body.userId || claims?.email || claims?.name || 'guest_user';
+  const payload = {
+    ...req.body,
+    userId,
+    userEmail: claims?.email || req.body?.userEmail || null,
+  };
+  const booking = bookingStateMachine.createBooking(payload, userId);
   res.status(201).json({
     success: true,
     bookingId: booking.id,
@@ -141,46 +194,28 @@ router.post(['/booking/create', '/bookings/create', '/bookings', '/instant/reque
   });
 });
 
-router.get('/bookings/active', (req, res) => {
+router.get(['/bookings/active', '/instant/active'], (req, res) => {
+  const { claims, keys } = getUserFilterKeys(req);
+  if (!keys.length) return res.json({ success: true, booking: null, data: null });
   const all = store.list('bookings');
   const active = all.find(
     (b) =>
-      b.status !== 'COMPLETED' &&
-      b.status !== 'CANCELLED' &&
-      b.status !== 'EXPIRED'
-  );
-  if (!active) return res.json({ success: true, booking: null });
-  res.json({
-    success: true,
-    booking: bookingStateMachine.sanitizeForUser(active),
-  });
-});
-
-router.get('/instant/active', (req, res) => {
-  const all = store.list('bookings');
-  const active = all.find(
-    (b) =>
+      recordMatchesUser(b, keys, claims) &&
       b.status !== 'COMPLETED' &&
       b.status !== 'CANCELLED' &&
       b.status !== 'EXPIRED'
   );
   if (!active) return res.json({ success: true, booking: null, data: null });
-  res.json({
-    success: true,
-    booking: bookingStateMachine.sanitizeForUser(active),
-    data: bookingStateMachine.sanitizeForUser(active),
-  });
+  const sanitized = bookingStateMachine.sanitizeForUser(active);
+  res.json({ success: true, booking: sanitized, data: sanitized });
 });
 
-router.get('/booking/my', (req, res) => {
-  const list = [...store.list('bookings')]
-    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
-    .map(bookingStateMachine.sanitizeForUser);
-  res.json({ success: true, data: list, bookings: list });
-});
-
-router.get('/bookings/my', (req, res) => {
-  const list = [...store.list('bookings')]
+router.get(['/booking/my', '/bookings/my'], (req, res) => {
+  const { claims, keys } = getUserFilterKeys(req);
+  if (!keys.length) return res.json({ success: true, data: [], bookings: [] });
+  const list = store
+    .list('bookings')
+    .filter((b) => recordMatchesUser(b, keys, claims))
     .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
     .map(bookingStateMachine.sanitizeForUser);
   res.json({ success: true, data: list, bookings: list });
@@ -221,15 +256,87 @@ router.get('/order/track/:id', (req, res) => {
   o ? res.json(o) : res.status(404).json({ message: 'Not found' });
 });
 
-/* ---------- Wallet ---------- */
-router.get('/wallet', requireAuth, (req, res) => {
-  const tx = store.list('wallet_tx', { field: 'user', value: req.auth.name });
-  const bal = tx.reduce((s, t) => s + (t.type === 'credit' ? t.amount : -t.amount), 0);
-  res.json({ balance: bal, transactions: tx });
+/* ---------- Wallet (Zero-initialized & Live Persisted per User) ---------- */
+function getUserWalletSummary(claims) {
+  if (!claims?.sub) return { balance: 0, transactions: [], userRecord: null };
+  const userRecord = store.get('users', claims.sub) || null;
+  const tx = store
+    .list('wallet_tx')
+    .filter((t) => (t.userId ? t.userId === claims.sub : claims.name && t.user === claims.name))
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  const computedBal = tx.reduce(
+    (s, t) => s + (t.type === 'credit' ? Number(t.amount || 0) : -Number(t.amount || 0)),
+    0
+  );
+  const balance = userRecord?.wallet != null ? Number(userRecord.wallet) : Math.max(0, computedBal);
+  return { balance: Math.max(0, balance), transactions: tx, userRecord };
+}
+
+router.get(['/wallet', '/wallet/balance', '/wallet/ledger'], (req, res) => {
+  const claims = extractAuthClaims(req);
+  const { balance, transactions } = getUserWalletSummary(claims);
+  res.json({
+    success: true,
+    balance,
+    walletBalance: balance,
+    mainBalance: balance,
+    bonusBalance: 0,
+    transactions,
+    ledger: transactions,
+    data: { balance, mainBalance: balance, bonusBalance: 0, transactions },
+  });
 });
-router.post('/wallet/add', requireAuth, (req, res) => {
-  const t = store.insert('wallet_tx', { user: req.auth.name, type: 'credit', title: 'Added via ' + (req.body.method || 'UPI'), amount: req.body.amount, at: new Date().toLocaleDateString('en-IN') });
-  res.status(201).json(t);
+
+router.post(['/wallet/add', '/wallet/credit'], (req, res) => {
+  const claims = extractAuthClaims(req);
+  if (!claims?.sub) {
+    return res.status(401).json({ success: false, message: 'Login required for wallet transaction' });
+  }
+  const amount = Number(req.body?.amount || 0);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ success: false, message: 'Invalid amount' });
+  }
+  const { balance, userRecord } = getUserWalletSummary(claims);
+  const nextBal = balance + amount;
+  if (userRecord) {
+    store.update('users', userRecord.id, { wallet: nextBal });
+  }
+  const t = store.insert('wallet_tx', {
+    userId: claims.sub,
+    user: claims.name || claims.email || claims.sub,
+    type: 'credit',
+    title: req.body?.reference || ('Added via ' + (req.body?.method || 'UPI')),
+    amount,
+    at: new Date().toLocaleDateString('en-IN'),
+    createdAt: new Date().toISOString(),
+  });
+  res.status(201).json({ success: true, balance: nextBal, transaction: t, ...t });
+});
+
+router.post('/wallet/deduct', (req, res) => {
+  const claims = extractAuthClaims(req);
+  if (!claims?.sub) {
+    return res.status(401).json({ success: false, message: 'Login required for wallet transaction' });
+  }
+  const amount = Number(req.body?.amount || 0);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ success: false, message: 'Invalid amount' });
+  }
+  const { balance, userRecord } = getUserWalletSummary(claims);
+  const nextBal = Math.max(0, balance - amount);
+  if (userRecord) {
+    store.update('users', userRecord.id, { wallet: nextBal });
+  }
+  const t = store.insert('wallet_tx', {
+    userId: claims.sub,
+    user: claims.name || claims.email || claims.sub,
+    type: 'debit',
+    title: req.body?.reference || req.body?.reason || 'Consultation / Service Fee',
+    amount,
+    at: new Date().toLocaleDateString('en-IN'),
+    createdAt: new Date().toISOString(),
+  });
+  res.json({ success: true, balance: nextBal, transaction: t });
 });
 
 /* ---------- Kundali / donation (stubs) ---------- */

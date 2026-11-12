@@ -153,7 +153,7 @@ router.post(['/google', '/auth/google'], (req, res) => {
       city: req.body.city || 'Noida',
       photo: photo || null,
       orders: 0,
-      wallet: 500,
+      wallet: 0,
       status: 'Active',
       createdAt: new Date().toISOString(),
     });
@@ -189,7 +189,7 @@ router.post('/firebase', (req, res) => {
       email: email || '',
       city: 'Noida',
       orders: 0,
-      wallet: 500,
+      wallet: 0,
       status: 'Active',
       createdAt: new Date().toISOString(),
     });
@@ -461,7 +461,12 @@ router.post('/register-account', (req, res) => {
     profileCompleted: false, // Partner must complete details next
     kyc: 'Pending',
     status: 'Incomplete',
-    rating: 5.0,
+    walletBalance: 0,
+    totalEarned: 0,
+    expectedEarnings: 0,
+    rating: 0,
+    reviewsCount: 0,
+    completedPoojaCount: 0,
     jobs: 0,
     createdAt: new Date().toISOString(),
   });
@@ -549,6 +554,9 @@ router.post('/verify-otp', (req, res) => {
       name: name || 'Devotee ' + cleanPhone.slice(-4),
       phone: cleanPhone,
       status: 'Active',
+      ...(coll === 'users'
+        ? { orders: 0, wallet: 0 }
+        : { walletBalance: 0, totalEarned: 0, expectedEarnings: 0, jobs: 0, reviewsCount: 0, rating: 0, completedPoojaCount: 0 }),
       createdAt: new Date().toISOString(),
     });
   }

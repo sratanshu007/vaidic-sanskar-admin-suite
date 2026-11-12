@@ -12,6 +12,13 @@ function verify(token) {
   try { return jwt.verify(token, JWT_SECRET); } catch { return null; }
 }
 
+function extractAuthClaims(req) {
+  const h = req?.headers?.authorization || '';
+  const token = h.startsWith('Bearer ') ? h.slice(7) : null;
+  if (!token || token === 'demo-token' || token === 'admin-token') return null;
+  return verify(token);
+}
+
 // Express middleware: require a valid bearer token
 function requireAuth(req, res, next) {
   const h = req.headers.authorization || '';
@@ -35,4 +42,4 @@ function requireRole(...roles) {
   };
 }
 
-module.exports = { sign, verify, requireAuth, requireRole };
+module.exports = { sign, verify, extractAuthClaims, requireAuth, requireRole };
