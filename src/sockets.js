@@ -571,6 +571,12 @@ function initSockets(io) {
     // Complete OTP verified -> Pooja Completed state relay
     socket.on('booking:completed', ({ bookingId }) => {
       if (bookingId) {
+        try {
+          store.update('bookings', bookingId, {
+            status: 'COMPLETED',
+            completedAt: new Date().toISOString(),
+          });
+        } catch (e) {}
         io.to(`booking:${bookingId}`).emit('booking:completed', { bookingId, status: 'COMPLETED' });
         io.emit('booking:completed', { bookingId, status: 'COMPLETED' });
         io.emit('instant:update', { id: bookingId, status: 'COMPLETED' });

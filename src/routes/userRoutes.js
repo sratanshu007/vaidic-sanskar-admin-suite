@@ -172,6 +172,20 @@ router.get('/instant/active', (req, res) => {
   });
 });
 
+router.get('/booking/my', (req, res) => {
+  const list = [...store.list('bookings')]
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+    .map(bookingStateMachine.sanitizeForUser);
+  res.json({ success: true, data: list, bookings: list });
+});
+
+router.get('/bookings/my', (req, res) => {
+  const list = [...store.list('bookings')]
+    .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0))
+    .map(bookingStateMachine.sanitizeForUser);
+  res.json({ success: true, data: list, bookings: list });
+});
+
 router.get('/bookings/:id', (req, res) => {
   const b = store.get('bookings', req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
@@ -200,16 +214,6 @@ router.post('/bookings/:id/cancel', (req, res) => {
 router.put('/instant/:id/cancel', (req, res) => {
   const result = bookingStateMachine.cancelBooking(req.params.id, 'yajman', req.body.reason);
   res.status(result.success ? 200 : result.status || 400).json(result);
-});
-
-router.get('/booking/my', (req, res) => {
-  const list = store.list('bookings').map(bookingStateMachine.sanitizeForUser);
-  res.json({ success: true, data: list, bookings: list });
-});
-
-router.get('/bookings/my', (req, res) => {
-  const list = store.list('bookings').map(bookingStateMachine.sanitizeForUser);
-  res.json({ success: true, data: list, bookings: list });
 });
 
 /* ---------- Orders ---------- */
