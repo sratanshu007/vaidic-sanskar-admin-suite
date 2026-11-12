@@ -364,8 +364,18 @@ const bookingStateMachine = {
     const booking = store.get('bookings', bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
+    const cleanOtp = String(enteredOtp || '').trim();
+    if (!cleanOtp) {
+      return { success: false, status: 400, message: 'Please enter the 4-digit Start OTP.' };
+    }
+
     if (booking.status !== STATES.ARRIVED) {
-      return { success: false, status: 400, message: 'Booking must be in ARRIVED state to start pooja.' };
+      // Allow seamless transition if pandit is on the way / accepted and already at doorstep
+      if (booking.status === STATES.ACCEPTED || booking.status === STATES.EN_ROUTE) {
+        booking.status = STATES.ARRIVED;
+      } else {
+        return { success: false, status: 400, message: 'Booking must be in ARRIVED state to start pooja.' };
+      }
     }
 
     const otpRecord = booking.otps?.startOtp;
@@ -383,8 +393,8 @@ const bookingStateMachine = {
 
     otpRecord.attempts += 1;
 
-    // Verify hash
-    if (hashOtp(enteredOtp) !== otpRecord.hash && String(enteredOtp) !== String(booking.activeStartOtp)) {
+    // Verify hash (trimmed)
+    if (hashOtp(cleanOtp) !== otpRecord.hash && cleanOtp !== String(booking.activeStartOtp || '').trim()) {
       store.update('bookings', bookingId, booking);
       return { success: false, status: 400, message: 'Invalid Start OTP. Please check with Yajman.' };
     }
@@ -457,6 +467,11 @@ const bookingStateMachine = {
     const booking = store.get('bookings', bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
+    const cleanOtp = String(enteredOtp || '').trim();
+    if (!cleanOtp) {
+      return { success: false, status: 400, message: 'Please enter the 4-digit Completion OTP.' };
+    }
+
     if (booking.status !== STATES.POOJA_STARTED) {
       return { success: false, status: 400, message: 'Pooja must be in POOJA_STARTED state to complete.' };
     }
@@ -472,7 +487,7 @@ const bookingStateMachine = {
 
     otpRecord.attempts += 1;
 
-    if (hashOtp(enteredOtp) !== otpRecord.hash && String(enteredOtp) !== String(booking.activeCompleteOtp)) {
+    if (hashOtp(cleanOtp) !== otpRecord.hash && cleanOtp !== String(booking.activeCompleteOtp || '').trim()) {
       store.update('bookings', bookingId, booking);
       return { success: false, status: 400, message: 'Invalid Completion OTP.' };
     }

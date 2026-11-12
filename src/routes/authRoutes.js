@@ -4,9 +4,41 @@ const { ADMIN_EMAIL, ADMIN_PASSWORD } = require('../config');
 const store = require('../store');
 const { sendPartnerOtpEmail } = require('../services/emailService');
 
-// In-memory OTP caches with timestamp
+// Persistent + in-memory OTP caches so server restarts never invalidate recent OTPs
 const phoneOtps = new Map();
 const emailOtps = new Map();
+
+function savePersistedOtp(kind, key, code, expiresAt, extra = {}) {
+  const rec = { id: `${kind}:${key}`, kind, key, code: String(code), expiresAt, ...extra };
+  if (kind === 'email') emailOtps.set(key, rec);
+  if (kind === 'phone') phoneOtps.set(key, String(code));
+  try {
+    const existing = store.get('otp_codes', rec.id);
+    if (existing) store.update('otp_codes', rec.id, rec);
+    else store.insert('otp_codes', rec);
+  } catch (_) { }
+  return rec;
+}
+
+function getPersistedOtp(kind, key) {
+  if (kind === 'email' && emailOtps.has(key)) return emailOtps.get(key);
+  if (kind === 'phone' && phoneOtps.has(key)) {
+    return { code: phoneOtps.get(key), expiresAt: Date.now() + 10 * 60 * 1000 };
+  }
+  try {
+    return store.get('otp_codes', `${kind}:${key}`) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function clearPersistedOtp(kind, key) {
+  if (kind === 'email') emailOtps.delete(key);
+  if (kind === 'phone') phoneOtps.delete(key);
+  try {
+    store.remove?.('otp_codes', `${kind}:${key}`);
+  } catch (_) { }
+}
 
 /* ---------- Unified Login (Admin or Partner / User) ---------- */
 router.post('/login', (req, res) => {
@@ -232,9 +264,7 @@ router.post('/send-email-otp', async (req, res) => {
   const normalized = email.toLowerCase().trim();
   const code = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit OTP
 
-  emailOtps.set(normalized, {
-    code,
-    expiresAt: Date.now() + 10 * 60 * 1000, // 10 minutes expiry
+  savePersistedOtp('email', normalized, code, Date.now() + 10 * 60 * 1000, {
     name: name || 'Devotee',
   });
 
@@ -290,7 +320,7 @@ router.post('/verify-email-otp', (req, res) => {
   }
 
   const normalized = email.toLowerCase().trim();
-  const record = emailOtps.get(normalized);
+  const record = getPersistedOtp('email', normalized);
 
   if (!record) {
     return res.status(400).json({
@@ -300,7 +330,7 @@ router.post('/verify-email-otp', (req, res) => {
   }
 
   if (Date.now() > record.expiresAt) {
-    emailOtps.delete(normalized);
+    clearPersistedOtp('email', normalized);
     return res.status(400).json({
       success: false,
       message: 'ओटीपी की समय सीमा समाप्त हो गई है (OTP Expired). कृपया नया ओटीपी प्राप्त करें।',
@@ -315,7 +345,7 @@ router.post('/verify-email-otp', (req, res) => {
   }
 
   // OTP verified successfully
-  emailOtps.delete(normalized);
+  clearPersistedOtp('email', normalized);
   res.json({
     success: true,
     verified: true,
@@ -404,22 +434,22 @@ router.post('/email/send-otp', async (req, res) => {
   }
   const normalized = email.toLowerCase().trim();
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  emailOtps.set(normalized, { code, expiresAt: Date.now() + 10 * 60 * 1000, name: name || 'User' });
+  savePersistedOtp('email', normalized, code, Date.now() + 10 * 60 * 1000, { name: name || 'User' });
   try {
     await sendPartnerOtpEmail({ to: normalized, name: name || 'User', otp: code });
   } catch (e) { }
-  res.json({ success: true, message: `Verification code sent to ${normalized}`, devOtp: code });
+  res.json({ success: true, message: `Verification code sent to ${normalized}`, otp: code, devOtp: code });
 });
 
 router.post('/email/verify-otp', (req, res) => {
   const { email, otp } = req.body || {};
   if (!email || !otp) return res.status(400).json({ success: false, message: 'Email and OTP required' });
   const normalized = email.toLowerCase().trim();
-  const record = emailOtps.get(normalized);
+  const record = getPersistedOtp('email', normalized);
   if (!record || String(record.code).trim() !== String(otp).trim()) {
     return res.status(400).json({ success: false, message: 'Invalid OTP' });
   }
-  emailOtps.delete(normalized);
+  clearPersistedOtp('email', normalized);
   res.json({ success: true, verified: true, message: 'Email verified successfully!' });
 });
 
@@ -501,8 +531,12 @@ router.post('/send-otp', (req, res) => {
   const { phone } = req.body || {};
   if (!phone) return res.status(400).json({ success: false, message: 'Phone number is required' });
   const cleanPhone = String(phone).replace(/\D/g, '');
+  const last10 = cleanPhone.slice(-10);
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  phoneOtps.set(cleanPhone, code);
+  savePersistedOtp('phone', cleanPhone, code, Date.now() + 10 * 60 * 1000);
+  if (last10 && last10 !== cleanPhone) {
+    savePersistedOtp('phone', last10, code, Date.now() + 10 * 60 * 1000);
+  }
   phoneOtps.set(phone, code);
   console.log(`\n  📱 [User Phone OTP]`);
   console.log(`  → Verification code for ${cleanPhone}: ${code}\n`);
@@ -518,10 +552,14 @@ router.post('/send-otp', (req, res) => {
 router.post('/verify-otp', (req, res) => {
   const { phone, otp, role = 'user', name } = req.body || {};
   const cleanPhone = String(phone || '').replace(/\D/g, '');
+  const last10 = cleanPhone.slice(-10);
   const enteredOtp = String(otp || '').trim();
 
-  const expected = phoneOtps.get(cleanPhone) || phoneOtps.get(phone);
-  if (!expected || expected !== enteredOtp) {
+  const expected =
+    getPersistedOtp('phone', cleanPhone)?.code ||
+    (last10 ? getPersistedOtp('phone', last10)?.code : null) ||
+    phoneOtps.get(phone);
+  if (!expected || String(expected).trim() !== enteredOtp) {
     if (enteredOtp !== '123456') {
       return res.status(400).json({
         success: false,
@@ -529,7 +567,8 @@ router.post('/verify-otp', (req, res) => {
       });
     }
   }
-  phoneOtps.delete(cleanPhone);
+  clearPersistedOtp('phone', cleanPhone);
+  if (last10) clearPersistedOtp('phone', last10);
   phoneOtps.delete(phone);
 
   const coll = role === 'vendor' ? 'vendors' : 'users';
