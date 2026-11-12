@@ -19,16 +19,23 @@ router.post('/upload', upload.any(), async (req, res) => {
     }
 
     const folder = req.body?.folder || 'vaidic_sanskar_partners';
+    const proto = req.get('x-forwarded-proto') || req.protocol || 'https';
+    const host = req.get('host');
     const uploadPromises = files.map(async (file) => {
       const ext = '.' + ((file.originalname || 'image.jpg').split('.').pop() || 'jpg');
       const result = await uploadToCloudinary(file.buffer, {
         folder,
         ext,
       });
-      return result.secure_url || result.url;
+      const rawUrl = result.secure_url || result.url;
+      if (rawUrl && rawUrl.startsWith('/') && host) {
+        return `${proto}://${host}${rawUrl}`;
+      }
+      return rawUrl;
     });
 
     const urls = await Promise.all(uploadPromises);
+    const hasCloudinaryUrl = urls.some((u) => typeof u === 'string' && u.includes('res.cloudinary.com'));
 
     res.json({
       success: true,
@@ -36,7 +43,7 @@ router.post('/upload', upload.any(), async (req, res) => {
       url: urls[0],
       secure_url: urls[0],
       urls: urls,
-      source: 'cloudinary',
+      source: hasCloudinaryUrl ? 'cloudinary' : 'local',
     });
   } catch (err) {
     console.error('Upload handler error:', err);
@@ -96,23 +103,21 @@ const handleVendorRegister = (req, res) => {
 router.post('/vendor/register', handleVendorRegister);
 router.post('/register', handleVendorRegister);
 
-/* ---------- Complete Profile (Step 2 after account creation) ---------- */
-const handleVendorCompleteProfile = (req, res) => {
-  const { phone, email, id, role } = req.body || {};
+function findVendorFromRequest(req) {
+  const { phone, email, id } = req.body || {};
+  const normalizedEmail = email ? String(email).toLowerCase().trim() : null;
+
   let vendor = null;
-
-  const normalizedEmail = email ? email.toLowerCase().trim() : null;
-
   if (id) vendor = store.get('vendors', id);
   if (!vendor && normalizedEmail) {
     vendor = store.list('vendors').find(
-      (v) => v.email && v.email.toLowerCase().trim() === normalizedEmail
+      (v) => v.email && String(v.email).toLowerCase().trim() === normalizedEmail
     );
   }
   if (!vendor && phone) {
     const cleanPhone = String(phone).replace(/\D/g, '');
     vendor = store.list('vendors').find((v) => {
-      if (v.phone && v.phone.trim() === String(phone).trim()) return true;
+      if (v.phone && String(v.phone).trim() === String(phone).trim()) return true;
       if (cleanPhone.length >= 10 && v.phone) {
         const vDigits = String(v.phone).replace(/\D/g, '');
         return vDigits.endsWith(cleanPhone.slice(-10)) || cleanPhone.endsWith(vDigits.slice(-10));
@@ -120,17 +125,48 @@ const handleVendorCompleteProfile = (req, res) => {
       return false;
     });
   }
-  if (!vendor && req.headers?.authorization) {
-    try {
-      const jwt = require('jsonwebtoken');
-      const { JWT_SECRET } = require('../config');
-      const token = req.headers.authorization.replace(/^Bearer\s+/i, '');
-      const decoded = jwt.verify(token, JWT_SECRET);
-      if (decoded && (decoded.sub || decoded.id)) {
-        vendor = store.get('vendors', decoded.sub || decoded.id);
-      }
-    } catch (e) {}
+  if (!vendor && (req.auth?.sub || req.headers?.authorization)) {
+    if (req.auth?.sub) vendor = store.get('vendors', req.auth.sub);
+    if (!vendor && req.headers?.authorization) {
+      try {
+        const jwt = require('jsonwebtoken');
+        const { JWT_SECRET } = require('../config');
+        const token = req.headers.authorization.replace(/^Bearer\s+/i, '');
+        const decoded = jwt.verify(token, JWT_SECRET);
+        if (decoded && (decoded.sub || decoded.id)) {
+          vendor = store.get('vendors', decoded.sub || decoded.id);
+        }
+      } catch (e) {}
+    }
   }
+  return vendor;
+}
+
+const PRESERVE_IF_EMPTY_KEYS = new Set([
+  'photo', 'profileImage', 'aadhaarFront', 'aadhaarBack', 'panFront',
+  'idCardFront', 'idCardBack', 'panCardPhoto', 'aadhaarNumber', 'panNumber',
+  'gurukul', 'degree', 'preferredIdType', 'city',
+]);
+
+function sanitizeVendorPatch(body) {
+  const patch = {};
+  for (const [key, val] of Object.entries(body || {})) {
+    if (val === undefined) continue;
+    if (typeof val === 'string' && /^(file|content|ph):\/\//i.test(val.trim())) {
+      continue;
+    }
+    if (PRESERVE_IF_EMPTY_KEYS.has(key) && (val === null || (typeof val === 'string' && !val.trim()))) {
+      continue;
+    }
+    patch[key] = val;
+  }
+  return patch;
+}
+
+/* ---------- Complete Profile (Step 2 after account creation) ---------- */
+const handleVendorCompleteProfile = (req, res) => {
+  const { role } = req.body || {};
+  const vendor = findVendorFromRequest(req);
 
   if (!vendor) {
     return res.status(404).json({
@@ -139,8 +175,9 @@ const handleVendorCompleteProfile = (req, res) => {
     });
   }
 
+  const cleanPatch = sanitizeVendorPatch(req.body);
   const updated = store.update('vendors', vendor.id, {
-    ...req.body,
+    ...cleanPatch,
     role: role || vendor.role,
     profileCompleted: true,
     kyc: 'Pending',
@@ -162,24 +199,15 @@ router.post('/complete-profile', handleVendorCompleteProfile);
 
 /* ---------- Vendor Profile Update ---------- */
 router.put('/vendor/profile', (req, res) => {
-  const { phone, email, id } = req.body || {};
-  const normalizedEmail = email ? email.toLowerCase().trim() : null;
-
-  let existing = null;
-  if (id) existing = store.get('vendors', id);
-  if (!existing && normalizedEmail) {
-    existing = store.list('vendors').find((v) => v.email && v.email.toLowerCase().trim() === normalizedEmail);
-  }
-  if (!existing && phone) {
-    existing = store.list('vendors').find((v) => v.phone && v.phone.trim() === phone.trim());
-  }
+  const existing = findVendorFromRequest(req);
 
   if (!existing) {
     return res.status(404).json({ success: false, message: 'Vendor not found' });
   }
 
+  const cleanPatch = sanitizeVendorPatch(req.body);
   const updated = store.update('vendors', existing.id, {
-    ...req.body,
+    ...cleanPatch,
     updatedAt: new Date().toISOString(),
   });
 
