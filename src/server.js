@@ -117,7 +117,11 @@ app.get('*', (req, res, next) => {
 });
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') } });
+const io = new Server(server, {
+  cors: { origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+});
 initSockets(io);
 
 const { connectDB } = require('./db');

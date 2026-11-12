@@ -591,7 +591,7 @@ router.post('/bookings/:id/verify-complete-otp', (req, res) => {
   const { vendorId } = getVendorDetails(req);
   const otp = req.body.otp || req.body.completeOtp;
   const booking = store.get('bookings', req.params.id);
-  if (booking && (!booking.activeCompleteOtp || !booking.otps?.completeOtp)) {
+  if (booking && !booking.completeOtp && !booking.otps?.completeOtp) {
     bookingStateMachine.requestCompletion(req.params.id, vendorId);
   }
   const result = bookingStateMachine.verifyCompleteOtp(req.params.id, vendorId, otp);
@@ -603,7 +603,7 @@ router.post('/job/complete', (req, res) => {
   const { vendorId } = getVendorDetails(req);
   const otp = req.body.otp || req.body.completeOtp || req.body.endOtp;
   const booking = store.get('bookings', bookingId);
-  if (booking && (!booking.activeCompleteOtp || !booking.otps?.completeOtp)) {
+  if (booking && !booking.completeOtp && !booking.otps?.completeOtp) {
     bookingStateMachine.requestCompletion(bookingId, vendorId);
   }
   const result = bookingStateMachine.verifyCompleteOtp(bookingId, vendorId, otp);

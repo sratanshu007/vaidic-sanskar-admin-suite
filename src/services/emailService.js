@@ -1,6 +1,57 @@
 const nodemailer = require('nodemailer');
 
 let transporter = null;
+let smtpReachable = null; // null = unknown, true = verified, false = blocked/timeout
+
+function parseSender(raw) {
+  const clean = String(raw || '').trim();
+  const m = clean.match(/^(.*?)\s*<([^>]+)>$/);
+  if (m) {
+    return { name: m[1].replace(/^["']|["']$/g, '').trim() || 'Vaidic Sanskar', email: m[2].trim() };
+  }
+  return { name: 'Vaidic Sanskar', email: clean || 'noreply@vaidicsanskar.com' };
+}
+
+async function sendViaBrevo({ to, name, otp, subject, text, html }) {
+  const apiKey = (process.env.BREVO_API_KEY || process.env.SENDINBLUE_API_KEY || '').trim();
+  if (!apiKey) return null;
+
+  const sender = parseSender(
+    process.env.BREVO_SENDER_EMAIL || process.env.EMAIL_FROM || process.env.SMTP_FROM || process.env.SMTP_USER
+  );
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+
+  try {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+      method: 'POST',
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json',
+        'api-key': apiKey,
+      },
+      body: JSON.stringify({
+        sender,
+        to: [{ email: to, name: name && name !== 'Partner' ? name : 'Partner' }],
+        subject,
+        textContent: text,
+        htmlContent: html,
+      }),
+      signal: controller.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data?.message || `Brevo HTTP ${res.status}`);
+    }
+    console.log(`  ✅ [Brevo Success] Verification OTP sent to ${to}. MessageId: ${data.messageId || 'ok'}`);
+    return { success: true, provider: 'brevo', messageId: data.messageId, otp };
+  } catch (err) {
+    console.error(`  ❌ [Brevo Error] Failed sending to ${to}:`, err.message);
+    return { success: false, provider: 'brevo', error: err.message };
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 function getTransporter() {
   if (transporter) return transporter;
@@ -115,42 +166,74 @@ async function sendPartnerOtpEmail({ to, name = 'User', otp, lang = 'en' }) {
   </html>
   `;
 
-  if (!mailer) {
-    console.log(`\n  📨 [SMTP Fallback Log] Email OTP for ${to}: ${otp}\n`);
+  const subject = `Your Vaidic Sanskar Partner Verification Code: ${otp}`;
+  const text = `Dear ${name},\n\nYour Vaidic Sanskar Partner verification code is: ${otp}\n\nThis code is valid for 10 minutes.\n\nThank you,\nVaidic Sanskar Partner Team`;
+
+  // 1. Primary: Brevo Transactional Email API (HTTPS port 443 — bypasses Render SMTP blocks)
+  const brevoRes = await sendViaBrevo({
+    to,
+    name,
+    otp,
+    subject,
+    text,
+    html: htmlContent,
+  });
+  if (brevoRes?.success) {
+    return brevoRes;
+  }
+
+  // 2. Secondary: Direct SMTP (when SMTP_USER/PASS work locally)
+  if (!mailer || smtpReachable === false) {
+    console.log(`  📨 [OTP Fallback] Email OTP for ${to}: ${otp}`);
     return { success: true, simulated: true, otp };
   }
 
   try {
-    const info = await mailer.sendMail({
-      from,
-      to,
-      subject: `Your Vaidic Sanskar Partner Verification Code: ${otp}`,
-      text: `Dear ${name},\n\nYour Vaidic Sanskar Partner verification code is: ${otp}\n\nThis code is valid for 10 minutes.\n\nThank you,\nVaidic Sanskar Partner Team`,
-      html: htmlContent,
-    });
+    const info = await Promise.race([
+      mailer.sendMail({
+        from,
+        to,
+        subject,
+        text,
+        html: htmlContent,
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('SMTP timeout')), 3500)),
+    ]);
+    smtpReachable = true;
     console.log(`  ✅ [SMTP Success] Verification OTP sent to ${to}. MessageId: ${info.messageId}`);
     return { success: true, messageId: info.messageId, otp };
   } catch (error) {
-    console.error(`  ❌ [SMTP Error] Failed sending to ${to}:`, error.message);
-    return { success: false, error: error.message, simulatedOtp: otp };
+    smtpReachable = false;
+    console.warn(`  ℹ️ [SMTP Fallback] SMTP unreachable for ${to} (${error.message}). Returning instant fallback OTP.`);
+    return { success: true, simulated: true, simulatedOtp: otp, otp };
   }
 }
 
 async function verifySmtp() {
-  const mailer = getTransporter();
-  if (!mailer) return false;
+  if ((process.env.BREVO_API_KEY || process.env.SENDINBLUE_API_KEY || '').trim()) {
+    console.log('  📧 Brevo HTTPS Email API configured for OTP delivery!');
+    return true;
+  }
 
-  // Race verify against a 6-second timeout so server never hangs during deployment
+  const mailer = getTransporter();
+  if (!mailer) {
+    smtpReachable = false;
+    return false;
+  }
+
+  // Race verify against a 4-second timeout so server never hangs during deployment
   const verifyPromise = mailer.verify();
   const timeoutPromise = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('Connection timeout (Render dynamic IP / port filter)')), 6000)
+    setTimeout(() => reject(new Error('Connection timeout (Render dynamic IP / port filter)')), 4000)
   );
 
   try {
     await Promise.race([verifyPromise, timeoutPromise]);
+    smtpReachable = true;
     console.log('  📧 SMTP Server Connected and Verified Successfully!');
     return true;
   } catch (err) {
+    smtpReachable = false;
     console.warn(`  ℹ️ SMTP verify notice: ${err.message}. OTP delivery will fallback to active console log & API response.`);
     return false;
   }

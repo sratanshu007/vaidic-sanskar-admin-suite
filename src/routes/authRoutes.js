@@ -254,25 +254,22 @@ router.post('/partner-login', (req, res) => {
   });
 });
 
-/* ---------- Email OTP: Send Verification Code ---------- */
-router.post('/send-email-otp', async (req, res) => {
+/* ---------- Email OTP: Send & Verify Shared Handlers ---------- */
+async function handleSendEmailOtp(req, res) {
   const { email, name } = req.body || {};
   if (!email || !email.includes('@')) {
     return res.status(400).json({ success: false, message: 'कृपया वैध ईमेल दर्ज करें (Valid email required).' });
   }
 
   const normalized = email.toLowerCase().trim();
-  const code = String(Math.floor(100000 + Math.random() * 900000)); // 6-digit OTP
+  const code = String(Math.floor(100000 + Math.random() * 900000));
 
   savePersistedOtp('email', normalized, code, Date.now() + 10 * 60 * 1000, {
     name: name || 'Devotee',
   });
 
-  console.log(`\n  🕉  [Vaidic Sanskar Auth]`);
-  console.log(`  → Email OTP for ${normalized}: ${code}`);
-  console.log(`  → Sending email via SMTP...\n`);
+  console.log(`\n  🕉  [Vaidic Sanskar Auth] Email OTP for ${normalized}: ${code}`);
 
-  // Dispatch real email via SMTP
   try {
     const emailRes = await sendPartnerOtpEmail({
       to: normalized,
@@ -280,19 +277,18 @@ router.post('/send-email-otp', async (req, res) => {
       otp: code,
     });
 
-    if (emailRes && emailRes.success === false && !emailRes.simulated) {
-      console.warn('  ⚠️ SMTP delivery warning:', emailRes.error);
+    if (!emailRes || emailRes.simulated || emailRes.success === false) {
       return res.json({
         success: true,
         sent: false,
         simulated: true,
         otp: code,
         devOtp: code,
-        message: `सत्यापन कोड (OTP): ${code} (ईमेल प्रेषण में समस्या, कृपया इस कोड का प्रयोग करें)।`,
+        message: `सत्यापन कोड (OTP): ${code} (त्वरित इन-ऐप कोड का प्रयोग करें)।`,
       });
     }
 
-    res.json({
+    return res.json({
       success: true,
       sent: true,
       otp: code,
@@ -300,20 +296,18 @@ router.post('/send-email-otp', async (req, res) => {
       message: `सत्यापन कोड (OTP) ${normalized} पर भेज दिया गया है। कृपया अपना ईमेल चेक करें।`,
     });
   } catch (err) {
-    console.error('SMTP error:', err.message);
-    res.json({
+    return res.json({
       success: true,
       sent: false,
       simulated: true,
       otp: code,
       devOtp: code,
-      message: `सत्यापन कोड (OTP): ${code} (ईमेल भेजने में विलंब, कृपया कोड का उपयोग करें)।`,
+      message: `सत्यापन कोड (OTP): ${code} (त्वरित कोड का उपयोग करें)।`,
     });
   }
-});
+}
 
-/* ---------- Email OTP: Verify Code ---------- */
-router.post('/verify-email-otp', (req, res) => {
+function handleVerifyEmailOtp(req, res) {
   const { email, otp } = req.body || {};
   if (!email || !otp) {
     return res.status(400).json({ success: false, message: 'ईमेल और ओटीपी दोनों आवश्यक हैं।' });
@@ -344,14 +338,18 @@ router.post('/verify-email-otp', (req, res) => {
     });
   }
 
-  // OTP verified successfully
   clearPersistedOtp('email', normalized);
-  res.json({
+  return res.json({
     success: true,
     verified: true,
     message: 'ईमेल सफलतापूर्वक सत्यापित हो गया है (Email Verified)!',
   });
-});
+}
+
+router.post('/send-email-otp', handleSendEmailOtp);
+router.post('/verify-email-otp', handleVerifyEmailOtp);
+router.post('/email/send-otp', handleSendEmailOtp);
+router.post('/email/verify-otp', handleVerifyEmailOtp);
 
 /* ---------- Forgot Password (OTP via Email) ---------- */
 router.post('/forgot-password', async (req, res) => {
@@ -363,28 +361,28 @@ router.post('/forgot-password', async (req, res) => {
   const normalized = email.toLowerCase().trim();
   const code = String(Math.floor(100000 + Math.random() * 900000));
 
-  emailOtps.set(normalized, {
-    code,
-    expiresAt: Date.now() + 15 * 60 * 1000,
+  savePersistedOtp('reset', normalized, code, Date.now() + 15 * 60 * 1000, {
     purpose: 'password_reset',
   });
 
-  console.log(`\n  🕉  [Password Reset OTP]`);
-  console.log(`  → Reset Code for ${normalized}: ${code}\n`);
+  console.log(`\n  🕉  [Password Reset OTP] Code for ${normalized}: ${code}`);
 
+  let emailRes = null;
   try {
-    await sendPartnerOtpEmail({
+    emailRes = await sendPartnerOtpEmail({
       to: normalized,
       name: 'User',
       otp: code,
     });
-  } catch (err) {
-    console.error('SMTP send error:', err.message);
-  }
+  } catch (_) { }
 
   res.json({
     success: true,
-    message: 'If an account exists for that email, a password-reset code has been sent.',
+    sent: !!(emailRes && !emailRes.simulated && emailRes.success !== false),
+    simulated: !!(emailRes && emailRes.simulated),
+    message: emailRes?.simulated
+      ? `Password reset code: ${code}`
+      : 'If an account exists for that email, a password-reset code has been sent.',
     devOtp: code,
   });
 });
@@ -397,18 +395,18 @@ router.post('/reset-password', (req, res) => {
   }
 
   const normalized = email.toLowerCase().trim();
-  const record = emailOtps.get(normalized);
+  const record = getPersistedOtp('reset', normalized);
 
   if (!record || String(record.code).trim() !== String(otp).trim()) {
     return res.status(400).json({ success: false, message: 'Invalid or expired reset code' });
   }
 
   if (Date.now() > record.expiresAt) {
-    emailOtps.delete(normalized);
+    clearPersistedOtp('reset', normalized);
     return res.status(400).json({ success: false, message: 'Reset code expired. Please request a new one.' });
   }
 
-  emailOtps.delete(normalized);
+  clearPersistedOtp('reset', normalized);
 
   // Update password in vendors or users store
   const vendor = store.list('vendors').find((v) => v.email && v.email.toLowerCase() === normalized);
@@ -424,33 +422,6 @@ router.post('/reset-password', (req, res) => {
     success: true,
     message: 'Password reset successful. You may now log in with your new password.',
   });
-});
-
-/* Route aliases to support both /email/send-otp and /send-email-otp */
-router.post('/email/send-otp', async (req, res) => {
-  const { email, name } = req.body || {};
-  if (!email || !email.includes('@')) {
-    return res.status(400).json({ success: false, message: 'Valid email required' });
-  }
-  const normalized = email.toLowerCase().trim();
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  savePersistedOtp('email', normalized, code, Date.now() + 10 * 60 * 1000, { name: name || 'User' });
-  try {
-    await sendPartnerOtpEmail({ to: normalized, name: name || 'User', otp: code });
-  } catch (e) { }
-  res.json({ success: true, message: `Verification code sent to ${normalized}`, otp: code, devOtp: code });
-});
-
-router.post('/email/verify-otp', (req, res) => {
-  const { email, otp } = req.body || {};
-  if (!email || !otp) return res.status(400).json({ success: false, message: 'Email and OTP required' });
-  const normalized = email.toLowerCase().trim();
-  const record = getPersistedOtp('email', normalized);
-  if (!record || String(record.code).trim() !== String(otp).trim()) {
-    return res.status(400).json({ success: false, message: 'Invalid OTP' });
-  }
-  clearPersistedOtp('email', normalized);
-  res.json({ success: true, verified: true, message: 'Email verified successfully!' });
 });
 
 /* ---------- Partner Account Creation (Name + Email + Password) ---------- */

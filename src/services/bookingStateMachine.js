@@ -112,6 +112,18 @@ function sanitizeForVendor(booking, isAssigned) {
   return clone;
 }
 
+/**
+ * Look up a booking by primary id or bookingId alias.
+ */
+function findBooking(bookingId) {
+  if (!bookingId) return null;
+  return (
+    store.get('bookings', bookingId) ||
+    store.list('bookings').find((b) => String(b.id) === String(bookingId) || String(b.bookingId) === String(bookingId)) ||
+    null
+  );
+}
+
 const bookingStateMachine = {
   STATES,
 
@@ -316,35 +328,38 @@ const bookingStateMachine = {
   },
 
   /**
-   * Verified Arrival -> Generates and activates Start OTP (OTP 1)
+   * Verified Arrival -> Ensures Start OTP (OTP 1) is active without overwriting an existing unconsumed code
    */
   confirmArrival(bookingId, vendorId) {
-    const booking = store.get('bookings', bookingId);
+    const booking = findBooking(bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
     booking.status = STATES.ARRIVED;
-    booking.arrivedAt = new Date().toISOString();
+    booking.arrivedAt = booking.arrivedAt || new Date().toISOString();
     booking.updatedAt = new Date().toISOString();
+    if (!booking.otps) booking.otps = {};
 
-    // Generate cryptographic Start OTP
-    const rawStartOtp = generateSecureOtp();
+    const existingStart = booking.startOtp && !booking.otps.startOtp?.consumed ? String(booking.startOtp).trim() : null;
+    const rawStartOtp = existingStart || generateSecureOtp();
     booking.startOtp = rawStartOtp;
-    booking.otps.startOtp = {
-      hash: hashOtp(rawStartOtp),
-      expiresAt: Date.now() + 30 * 60 * 1000, // 30 mins
-      attempts: 0,
-      consumed: false,
-    };
-    booking.activeStartOtp = rawStartOtp; // Transmitted only to user
+    if (!booking.otps.startOtp || booking.otps.startOtp.consumed || !existingStart) {
+      booking.otps.startOtp = {
+        hash: hashOtp(rawStartOtp),
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        attempts: 0,
+        consumed: false,
+      };
+    }
+    booking.activeStartOtp = rawStartOtp;
 
-    store.update('bookings', bookingId, booking);
+    store.update('bookings', booking.id, booking);
 
     // Notify user that pandit has arrived and deliver Start OTP
     emit.toUser(booking.userId, 'booking:arrived', {
       ...sanitizeForUser(booking),
       startOtp: rawStartOtp,
     });
-    emit.all(`booking:${bookingId}`, {
+    emit.all(`booking:${booking.id}`, {
       event: 'booking:arrived',
       booking: sanitizeForUser(booking),
       startOtp: rawStartOtp,
@@ -361,7 +376,7 @@ const bookingStateMachine = {
    * Verify Start OTP (OTP 1) -> Moves to POOJA_STARTED
    */
   verifyStartOtp(bookingId, vendorId, enteredOtp) {
-    const booking = store.get('bookings', bookingId);
+    const booking = findBooking(bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
     const cleanOtp = String(enteredOtp || '').trim();
@@ -369,21 +384,34 @@ const bookingStateMachine = {
       return { success: false, status: 400, message: 'Please enter the 4-digit Start OTP.' };
     }
 
+    if (booking.status === STATES.COMPLETED || booking.status === STATES.CANCELLED) {
+      return { success: false, status: 400, message: `Booking is already ${booking.status}.` };
+    }
+
     if (booking.status !== STATES.ARRIVED) {
-      // Allow seamless transition if pandit is on the way / accepted and already at doorstep
-      if (booking.status === STATES.ACCEPTED || booking.status === STATES.EN_ROUTE) {
+      if (booking.status === STATES.ACCEPTED || booking.status === STATES.EN_ROUTE || booking.status === STATES.PENDING_ACCEPTANCE) {
         booking.status = STATES.ARRIVED;
       } else {
         return { success: false, status: 400, message: 'Booking must be in ARRIVED state to start pooja.' };
       }
     }
 
-    const otpRecord = booking.otps?.startOtp;
+    if (!booking.otps) booking.otps = {};
+    if (!booking.otps.startOtp && booking.startOtp) {
+      booking.otps.startOtp = {
+        hash: hashOtp(String(booking.startOtp).trim()),
+        expiresAt: Date.now() + 60 * 60 * 1000,
+        attempts: 0,
+        consumed: false,
+      };
+    }
+
+    const otpRecord = booking.otps.startOtp;
     if (!otpRecord || otpRecord.consumed) {
       return { success: false, status: 400, message: 'Start OTP already consumed or expired.' };
     }
 
-    if (Date.now() > otpRecord.expiresAt) {
+    if (otpRecord.expiresAt && Date.now() > otpRecord.expiresAt) {
       return { success: false, status: 400, message: 'Start OTP has expired. Please request a new one.' };
     }
 
@@ -393,13 +421,15 @@ const bookingStateMachine = {
 
     otpRecord.attempts += 1;
 
-    // Verify hash (trimmed)
-    if (hashOtp(cleanOtp) !== otpRecord.hash && cleanOtp !== String(booking.activeStartOtp || '').trim()) {
-      store.update('bookings', bookingId, booking);
+    const matchesPlain =
+      (booking.activeStartOtp && cleanOtp === String(booking.activeStartOtp).trim()) ||
+      (booking.startOtp && cleanOtp === String(booking.startOtp).trim());
+
+    if (hashOtp(cleanOtp) !== otpRecord.hash && !matchesPlain) {
+      store.update('bookings', booking.id, booking);
       return { success: false, status: 400, message: 'Invalid Start OTP. Please check with Yajman.' };
     }
 
-    // Atomically consume OTP 1 & start pooja
     otpRecord.consumed = true;
     otpRecord.consumedAt = new Date().toISOString();
     delete booking.activeStartOtp;
@@ -407,10 +437,10 @@ const bookingStateMachine = {
     booking.status = STATES.POOJA_STARTED;
     booking.poojaStartedAt = new Date().toISOString();
     booking.updatedAt = new Date().toISOString();
-    store.update('bookings', bookingId, booking);
+    store.update('bookings', booking.id, booking);
 
     emit.toUser(booking.userId, 'booking:started', sanitizeForUser(booking));
-    emit.all(`booking:${bookingId}`, { event: 'booking:started', booking: sanitizeForUser(booking) });
+    emit.all(`booking:${booking.id}`, { event: 'booking:started', booking: sanitizeForUser(booking) });
 
     return {
       success: true,
@@ -420,35 +450,45 @@ const bookingStateMachine = {
   },
 
   /**
-   * Request Completion -> Generates Completion OTP (OTP 2)
+   * Request Completion -> Ensures Completion OTP (OTP 2) is active without overwriting existing code
    */
   requestCompletion(bookingId, vendorId) {
-    const booking = store.get('bookings', bookingId);
+    const booking = findBooking(bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
-    if (booking.status !== STATES.POOJA_STARTED) {
-      return { success: false, status: 400, message: 'Pooja must be in progress to complete.' };
+    if (
+      booking.status !== STATES.POOJA_STARTED &&
+      booking.status !== STATES.ARRIVED &&
+      booking.status !== STATES.EN_ROUTE &&
+      booking.status !== STATES.ACCEPTED
+    ) {
+      return { success: false, status: 400, message: 'Booking cannot request completion in current state.' };
     }
 
-    const rawCompleteOtp = generateSecureOtp();
+    if (!booking.otps) booking.otps = {};
+    const existingComplete =
+      booking.completeOtp && !booking.otps.completeOtp?.consumed ? String(booking.completeOtp).trim() : null;
+    const rawCompleteOtp = existingComplete || generateSecureOtp();
     booking.completeOtp = rawCompleteOtp;
-    booking.otps.completeOtp = {
-      hash: hashOtp(rawCompleteOtp),
-      expiresAt: Date.now() + 30 * 60 * 1000,
-      attempts: 0,
-      consumed: false,
-    };
+    if (!booking.otps.completeOtp || booking.otps.completeOtp.consumed || !existingComplete) {
+      booking.otps.completeOtp = {
+        hash: hashOtp(rawCompleteOtp),
+        expiresAt: Date.now() + 120 * 60 * 1000,
+        attempts: 0,
+        consumed: false,
+      };
+    }
     booking.activeCompleteOtp = rawCompleteOtp;
 
-    store.update('bookings', bookingId, booking);
+    store.update('bookings', booking.id, booking);
 
     // Deliver completion OTP to the customer
     emit.toUser(booking.userId, 'booking:completion_requested', {
-      bookingId,
+      bookingId: booking.id,
       completeOtp: rawCompleteOtp,
       message: 'Pandit ji has completed the ritual. Please verify with this completion code.',
     });
-    emit.all(`booking:${bookingId}`, {
+    emit.all(`booking:${booking.id}`, {
       event: 'booking:completion_requested',
       completeOtp: rawCompleteOtp,
     });
@@ -464,7 +504,7 @@ const bookingStateMachine = {
    * Verify Completion OTP (OTP 2) -> Moves to COMPLETED
    */
   verifyCompleteOtp(bookingId, vendorId, enteredOtp) {
-    const booking = store.get('bookings', bookingId);
+    const booking = findBooking(bookingId);
     if (!booking) return { success: false, status: 404, message: 'Booking not found.' };
 
     const cleanOtp = String(enteredOtp || '').trim();
@@ -472,11 +512,29 @@ const bookingStateMachine = {
       return { success: false, status: 400, message: 'Please enter the 4-digit Completion OTP.' };
     }
 
-    if (booking.status !== STATES.POOJA_STARTED) {
-      return { success: false, status: 400, message: 'Pooja must be in POOJA_STARTED state to complete.' };
+    if (booking.status === STATES.COMPLETED) {
+      return {
+        success: true,
+        message: 'Pooja already completed.',
+        booking: sanitizeForVendor(booking, true),
+      };
     }
 
-    const otpRecord = booking.otps?.completeOtp;
+    if (booking.status === STATES.CANCELLED) {
+      return { success: false, status: 400, message: 'Cancelled booking cannot be completed.' };
+    }
+
+    if (!booking.otps) booking.otps = {};
+    if (!booking.otps.completeOtp && booking.completeOtp) {
+      booking.otps.completeOtp = {
+        hash: hashOtp(String(booking.completeOtp).trim()),
+        expiresAt: Date.now() + 120 * 60 * 1000,
+        attempts: 0,
+        consumed: false,
+      };
+    }
+
+    const otpRecord = booking.otps.completeOtp;
     if (!otpRecord || otpRecord.consumed) {
       return { success: false, status: 400, message: 'Completion OTP expired or already used.' };
     }
@@ -487,8 +545,12 @@ const bookingStateMachine = {
 
     otpRecord.attempts += 1;
 
-    if (hashOtp(cleanOtp) !== otpRecord.hash && cleanOtp !== String(booking.activeCompleteOtp || '').trim()) {
-      store.update('bookings', bookingId, booking);
+    const matchesPlain =
+      (booking.activeCompleteOtp && cleanOtp === String(booking.activeCompleteOtp).trim()) ||
+      (booking.completeOtp && cleanOtp === String(booking.completeOtp).trim());
+
+    if (hashOtp(cleanOtp) !== otpRecord.hash && !matchesPlain) {
+      store.update('bookings', booking.id, booking);
       return { success: false, status: 400, message: 'Invalid Completion OTP.' };
     }
 
@@ -501,23 +563,22 @@ const bookingStateMachine = {
     booking.completedAt = new Date().toISOString();
     booking.updatedAt = new Date().toISOString();
 
-    // Stop tracking
+    if (!booking.tracking) booking.tracking = {};
     booking.tracking.isSharingStopped = true;
 
-    // Credit earnings ledger for Pandit
-    const netEarning = Math.round(booking.totalAmount * 0.85);
+    const netEarning = Math.round((Number(booking.totalAmount || booking.amount || 2500)) * 0.85);
     store.insert('vendor_earnings', {
-      vendorId: booking.assignedVendorId,
-      bookingId,
+      vendorId: booking.assignedVendorId || vendorId || 'V9501',
+      bookingId: booking.id,
       amount: netEarning,
       status: 'Settled',
       createdAt: new Date().toISOString(),
     });
 
-    store.update('bookings', bookingId, booking);
+    store.update('bookings', booking.id, booking);
 
     emit.toUser(booking.userId, 'booking:completed', sanitizeForUser(booking));
-    emit.all(`booking:${bookingId}`, { event: 'booking:completed', booking: sanitizeForUser(booking) });
+    emit.all(`booking:${booking.id}`, { event: 'booking:completed', booking: sanitizeForUser(booking) });
 
     return {
       success: true,
@@ -603,6 +664,7 @@ const bookingStateMachine = {
     };
   },
 
+  findBooking,
   sanitizeForUser,
   sanitizeForVendor,
 };

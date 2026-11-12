@@ -187,23 +187,17 @@ router.get('/bookings/my', (req, res) => {
 });
 
 router.get('/bookings/:id', (req, res) => {
-  const b = store.get('bookings', req.params.id);
+  const b = bookingStateMachine.findBooking(req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
-  res.json({
-    success: true,
-    booking: bookingStateMachine.sanitizeForUser(b),
-    data: bookingStateMachine.sanitizeForUser(b),
-  });
+  const sanitized = bookingStateMachine.sanitizeForUser(b);
+  res.json({ success: true, booking: sanitized, data: sanitized });
 });
 
 router.get('/booking/:id', (req, res) => {
-  const b = store.get('bookings', req.params.id);
+  const b = bookingStateMachine.findBooking(req.params.id);
   if (!b) return res.status(404).json({ success: false, message: 'Booking not found' });
-  res.json({
-    success: true,
-    booking: bookingStateMachine.sanitizeForUser(b),
-    data: bookingStateMachine.sanitizeForUser(b),
-  });
+  const sanitized = bookingStateMachine.sanitizeForUser(b);
+  res.json({ success: true, booking: sanitized, data: sanitized });
 });
 
 router.post('/bookings/:id/cancel', (req, res) => {

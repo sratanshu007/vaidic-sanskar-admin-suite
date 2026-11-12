@@ -128,7 +128,7 @@ module.exports = {
       Record.findOneAndUpdate(
         { collectionName: name, recordId: row.id },
         { collectionName: name, recordId: row.id, data: row },
-        { upsert: true, new: true }
+        { upsert: true, returnDocument: 'after' }
       ).catch((err) => console.error(`MongoDB sync insert error (${name}):`, err.message));
       syncSpecializedModel(name, row, 'save');
     }
