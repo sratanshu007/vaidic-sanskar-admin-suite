@@ -177,6 +177,16 @@ router.get('/library/list', (req, res) => res.json({ data: store.list('library',
 
 const bookingStateMachine = require('../services/bookingStateMachine');
 
+/* ---------- Pricing Engine Quote ---------- */
+router.post(['/pricing/quote', '/bookings/quote', '/puja/quote'], (req, res) => {
+  const quote = bookingStateMachine.quotePricing(req.body);
+  res.json({
+    success: true,
+    quote,
+    pricing: quote,
+  });
+});
+
 /* ---------- Bookings (Uber/Rapido Pooja Engine) ---------- */
 router.post(['/booking/create', '/bookings/create', '/bookings', '/instant/request'], (req, res) => {
   const claims = extractAuthClaims(req);

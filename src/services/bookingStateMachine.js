@@ -113,6 +113,43 @@ function sanitizeForVendor(booking, isAssigned) {
 }
 
 /**
+ * Calculate itemized pricing quote & price snapshot
+ */
+function quotePricing(params = {}) {
+  const { ritualId, bookingType = 'NORMAL', withSamagri = true, basePrice = null } = params;
+  let base = Number(basePrice);
+  if (!base || isNaN(base)) {
+    const p = ritualId
+      ? store.get('pujas', ritualId) || store.list('pujas').find((x) => x.id === ritualId || x._id === ritualId)
+      : null;
+    base = Number(p?.price) || 2500;
+  }
+  const isUrgent = String(bookingType).toUpperCase() === 'URGENT';
+  // Urgent surcharge: fixed ₹350 or 15% of base pooja (greater of the two)
+  const urgentSurcharge = isUrgent ? Math.max(350, Math.round(base * 0.15)) : 0;
+  const samagriFee = withSamagri ? 600 : 0;
+  const travelFee = 0;
+  const platformFee = 50;
+  const taxable = base + urgentSurcharge + samagriFee;
+  const taxes = Math.round(taxable * 0.05); // 5% GST
+  const totalAmount = base + urgentSurcharge + samagriFee + travelFee + platformFee + taxes;
+
+  return {
+    bookingType: isUrgent ? 'URGENT' : 'NORMAL',
+    isUrgent,
+    basePrice: base,
+    urgentSurcharge,
+    samagriFee,
+    travelFee,
+    platformFee,
+    taxes,
+    totalAmount,
+    currency: 'INR',
+    calculatedAt: new Date().toISOString(),
+  };
+}
+
+/**
  * Look up a booking by primary id or bookingId alias.
  */
 function findBooking(bookingId) {
@@ -126,6 +163,7 @@ function findBooking(bookingId) {
 
 const bookingStateMachine = {
   STATES,
+  quotePricing,
 
   /**
    * Create a new booking request in PENDING_ACCEPTANCE and notify eligible vendors
@@ -135,6 +173,15 @@ const bookingStateMachine = {
     const startOtp = payload.startOtp || generateSecureOtp();
     const completeOtp = payload.completeOtp || generateSecureOtp();
 
+    const isUrgent = String(payload.bookingType || '').toUpperCase() === 'URGENT';
+    const withSamagri = payload.samagriPreference !== 'USER_ARRANGES' && payload.withSamagri !== false;
+    const priceQuote = quotePricing({
+      ritualId: payload.ritualId,
+      bookingType: isUrgent ? 'URGENT' : 'NORMAL',
+      withSamagri,
+      basePrice: payload.serviceCharge || payload.price,
+    });
+
     const booking = {
       id: bookingId,
       bookingId,
@@ -142,6 +189,9 @@ const bookingStateMachine = {
       ritualId: payload.ritualId || 'satyanarayan',
       ritualName: payload.ritualName || payload.name || 'Satyanarayan Pooja',
       status: STATES.PENDING_ACCEPTANCE,
+      bookingType: priceQuote.bookingType,
+      urgentSurcharge: priceQuote.urgentSurcharge,
+      priceSnapshot: priceQuote,
 
       // Timing
       scheduledDate: payload.scheduledDate || new Date().toISOString().split('T')[0],
@@ -155,20 +205,20 @@ const bookingStateMachine = {
       destinationLongitude: Number(payload.longitude) || 77.3910,
 
       // Requirements
-      samagriPreference: payload.samagriPreference || (payload.withSamagri ? 'PANDIT_BRINGS' : 'USER_ARRANGES'),
-      samagriFee: Number(payload.samagriFee) || (payload.withSamagri ? 600 : 0),
+      samagriPreference: payload.samagriPreference || (withSamagri ? 'PANDIT_BRINGS' : 'USER_ARRANGES'),
+      samagriFee: priceQuote.samagriFee,
       participantsCount: Number(payload.participantsCount) || 4,
       specialInstructions: payload.specialInstructions || '',
       preferredLanguage: payload.preferredLanguage || 'Hindi & Sanskrit',
       yajmanName: payload.yajmanName || 'Devotee',
       gotra: payload.gotra || 'Kashyap',
 
-      // Pricing
-      serviceCharge: Number(payload.serviceCharge || payload.price) || 2500,
-      travelFee: Number(payload.travelFee) || 0,
-      platformFee: 50,
-      taxes: Math.round(((Number(payload.serviceCharge || 2500) + Number(payload.samagriFee || 0)) * 0.05)),
-      totalAmount: 0,
+      // Pricing from quote snapshot
+      serviceCharge: priceQuote.basePrice,
+      travelFee: priceQuote.travelFee,
+      platformFee: priceQuote.platformFee,
+      taxes: priceQuote.taxes,
+      totalAmount: priceQuote.totalAmount,
 
       // State timestamps
       createdAt: new Date().toISOString(),

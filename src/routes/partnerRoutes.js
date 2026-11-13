@@ -657,7 +657,7 @@ router.get(['/pandit/offer', '/instant/pandit/offer'], (req, res) => {
   res.json({ success: true, offer: offer ? bookingStateMachine.sanitizeForVendor(offer, false) : null });
 });
 
-router.post('/bookings/:id/start-travel', (req, res) => {
+router.post(['/bookings/:id/start-travel', '/bookings/:id/start-journey', '/job/:id/start-journey'], (req, res) => {
   const { vendorId } = getVendorDetails(req);
   const result = bookingStateMachine.startTravel(req.params.id, vendorId);
   res.status(result.success ? 200 : result.status || 400).json(result);
@@ -669,28 +669,28 @@ router.post('/bookings/:id/location', (req, res) => {
   res.status(result.success ? 200 : 400).json(result);
 });
 
-router.post('/bookings/:id/arrive', (req, res) => {
+router.post(['/bookings/:id/arrive', '/bookings/:id/arrived', '/job/:id/arrived'], (req, res) => {
   const { vendorId } = getVendorDetails(req);
   const result = bookingStateMachine.confirmArrival(req.params.id, vendorId);
   res.status(result.success ? 200 : result.status || 400).json(result);
 });
 
-router.post('/bookings/:id/verify-start-otp', (req, res) => {
+router.post(['/bookings/:id/verify-start-otp', '/bookings/:id/verify-arrival-otp', '/job/:id/verify-arrival-otp'], (req, res) => {
   const { vendorId } = getVendorDetails(req);
-  const otp = req.body.otp || req.body.startOtp;
+  const otp = req.body.otp || req.body.startOtp || req.body.arrivalOtp;
   const result = bookingStateMachine.verifyStartOtp(req.params.id, vendorId, otp);
   res.status(result.success ? 200 : result.status || 400).json(result);
 });
 
-router.post('/bookings/:id/request-complete', (req, res) => {
+router.post(['/bookings/:id/request-complete', '/bookings/:id/complete', '/job/:id/request-complete'], (req, res) => {
   const { vendorId } = getVendorDetails(req);
   const result = bookingStateMachine.requestCompletion(req.params.id, vendorId);
   res.status(result.success ? 200 : result.status || 400).json(result);
 });
 
-router.post('/bookings/:id/verify-complete-otp', (req, res) => {
+router.post(['/bookings/:id/verify-complete-otp', '/bookings/:id/verify-completion-otp', '/job/:id/verify-completion-otp'], (req, res) => {
   const { vendorId } = getVendorDetails(req);
-  const otp = req.body.otp || req.body.completeOtp;
+  const otp = req.body.otp || req.body.completeOtp || req.body.completionOtp;
   const booking = store.get('bookings', req.params.id);
   if (booking && !booking.completeOtp && !booking.otps?.completeOtp) {
     bookingStateMachine.requestCompletion(req.params.id, vendorId);
