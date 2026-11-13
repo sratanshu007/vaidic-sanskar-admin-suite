@@ -203,6 +203,9 @@ function initSockets(io) {
     });
 
     // ---------------- ASTROLOGER AGORA CALL & CHAT SIGNALING ----------------
+    const USER_AGORA_UID = 10001;  // Devotee / User default UID
+    const ASTRO_AGORA_UID = 20001; // Astrologer / Partner default UID
+
     socket.on('astro:call:initiate', (payload) => {
       const { channelName, recipientId, caller, mode } = payload || {};
       const requestedId = recipientId ? String(recipientId) : null;
@@ -215,20 +218,46 @@ function initSockets(io) {
         socket.join(`channel:${channelName}`);
       }
 
-      let enrichedPayload = { ...payload };
+      let userAgoraData = null;
+      let astroAgoraData = null;
       try {
         if (channelName) {
-          const agoraData = generateRtcToken({ channelName, role: 'publisher' });
-          enrichedPayload = {
-            ...payload,
-            agoraAppId: agoraData.appId,
-            agoraToken: agoraData.token,
-            agoraMode: agoraData.mode,
-          };
+          userAgoraData = generateRtcToken({ channelName, uid: USER_AGORA_UID, role: 'publisher' });
+          astroAgoraData = generateRtcToken({ channelName, uid: ASTRO_AGORA_UID, role: 'publisher' });
         }
       } catch (err) {
         console.warn('⚠️ Agora token generation error in astro:call:initiate:', err.message);
       }
+
+      // Immediately provide the caller with their own UID 10001 token so caller joins Agora without delay
+      if (userAgoraData && userAgoraData.token) {
+        const callerReadyNotice = {
+          channelName,
+          agoraAppId: userAgoraData.appId,
+          agoraToken: userAgoraData.token,
+          agoraMode: userAgoraData.mode,
+          uid: USER_AGORA_UID,
+          remoteUid: ASTRO_AGORA_UID,
+          userUid: USER_AGORA_UID,
+          astroUid: ASTRO_AGORA_UID,
+        };
+        socket.emit('astro:call:ready', callerReadyNotice);
+        if (caller?.id) {
+          io.to(`user:${caller.id}`).emit('astro:call:ready', callerReadyNotice);
+        }
+      }
+
+      let enrichedPayload = {
+        ...payload,
+        agoraAppId: astroAgoraData?.appId || userAgoraData?.appId,
+        agoraToken: astroAgoraData?.token, // Token explicitly signed for Astrologer (UID 20001)
+        agoraMode: astroAgoraData?.mode,
+        uid: ASTRO_AGORA_UID,
+        remoteUid: USER_AGORA_UID,
+        userUid: USER_AGORA_UID,
+        astroUid: ASTRO_AGORA_UID,
+        userAgoraToken: userAgoraData?.token,
+      };
 
       const liveList = getLiveAstrologers(io);
       const exactOnlineAstro = requestedId
@@ -325,35 +354,61 @@ function initSockets(io) {
       }
 
       const matchedPartner = responderId ? activeAstroPartners.get(String(responderId)) : null;
-      let enrichedPayload = {
-        ...payload,
-        vendorId: responderId,
-        astrologer: payload?.astrologer || matchedPartner || undefined,
-      };
+
+      let userAgoraData = null;
+      let astroAgoraData = null;
       try {
         if (channelName) {
-          const agoraData = generateRtcToken({ channelName, role: 'publisher' });
-          enrichedPayload = {
-            ...enrichedPayload,
-            agoraAppId: agoraData.appId,
-            agoraToken: agoraData.token,
-            agoraMode: agoraData.mode,
-          };
+          userAgoraData = generateRtcToken({ channelName, uid: USER_AGORA_UID, role: 'publisher' });
+          astroAgoraData = generateRtcToken({ channelName, uid: ASTRO_AGORA_UID, role: 'publisher' });
         }
       } catch (err) {
         console.warn('⚠️ Agora token generation error in astro:call:accept:', err.message);
       }
 
-      const targetRooms = [];
-      if (callerId) targetRooms.push(`user:${callerId}`);
-      if (channelName) targetRooms.push(`channel:${channelName}`);
-      if (targetRooms.length > 0) {
-        emitOnceToRooms(io, targetRooms, 'astro:call:connected', enrichedPayload);
-      } else {
-        io.emit('astro:call:connected', enrichedPayload);
+      // Caller payload gets User token (UID 10001)
+      const callerPayload = {
+        ...payload,
+        vendorId: responderId,
+        astrologer: payload?.astrologer || matchedPartner || undefined,
+        agoraAppId: userAgoraData?.appId,
+        agoraToken: userAgoraData?.token,
+        agoraMode: userAgoraData?.mode,
+        uid: USER_AGORA_UID,
+        remoteUid: ASTRO_AGORA_UID,
+        userUid: USER_AGORA_UID,
+        astroUid: ASTRO_AGORA_UID,
+      };
+
+      // Astrologer payload gets Astrologer token (UID 20001)
+      const astroPayload = {
+        ...payload,
+        vendorId: responderId,
+        astrologer: payload?.astrologer || matchedPartner || undefined,
+        agoraAppId: astroAgoraData?.appId,
+        agoraToken: astroAgoraData?.token,
+        agoraMode: astroAgoraData?.mode,
+        uid: ASTRO_AGORA_UID,
+        remoteUid: USER_AGORA_UID,
+        userUid: USER_AGORA_UID,
+        astroUid: ASTRO_AGORA_UID,
+      };
+
+      // 1. Deliver user token directly to caller's private room
+      if (callerId) {
+        io.to(`user:${callerId}`).emit('astro:call:connected', callerPayload);
       }
+
+      // 2. Deliver to any other sockets in channel:channelName (excluding this socket)
       if (channelName) {
-        // Dismiss ringing popup on any other online astrologers if call was broadcast to role:astro
+        socket.to(`channel:${channelName}`).emit('astro:call:connected', callerPayload);
+      }
+
+      // 3. Deliver astro token directly to the responding Astrologer socket
+      socket.emit('astro:call:connected', astroPayload);
+
+      // 4. Dismiss ringing popup on any other online astrologers
+      if (channelName) {
         socket.to('role:astro').emit('astro:call:taken', { channelName, acceptedBy: responderId });
       }
     });
